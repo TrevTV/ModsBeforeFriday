@@ -12,7 +12,6 @@
 //! 5. Sign the APK and reinstall it.
 
 use std::{
-    collections::HashSet,
     fs::OpenOptions,
     io::Cursor,
     path::Path,
@@ -701,46 +700,34 @@ fn patch_manifest(zip: &mut ZipFile<std::fs::File>) -> Result<()> {
         existing_permissions.push(permission.to_owned());
     }
 
+    // NB: The splice inserts before the manifest's closing element, which is after the
+    // application element - so `application_index` remains valid afterwards.
     events.splice(manifest_close_index..manifest_close_index, permission_events);
 
-    // Recompute the manifest close index (permissions were inserted before it).
-    let manifest_close_index = events
-        .iter()
-        .position(|event| matches!(event, Event::EndElement { name, .. } if name == "manifest"))
-        .ok_or(anyhow!("No closing </manifest> element in the manifest"))?;
-
     // Add the application flags required by MelonLoader, if not already present.
-    if let Some(&index) = events
-        .iter()
-        .position(|event| matches!(event, Event::StartElement { name, .. } if name == "application"))
-        .as_ref()
-    {
-        if let Event::StartElement { attributes, .. } = &mut events[index] {
-            for (attr_name, value) in [
-                ("debuggable", mbf_axml::AttributeValue::Boolean(true)),
-                (
-                    "requestLegacyExternalStorage",
-                    mbf_axml::AttributeValue::Boolean(true),
-                ),
-            ] {
-                if attributes.iter().any(|attr| attr.name == attr_name) {
-                    debug!("Application flag {attr_name} already present, skipping");
-                    continue;
-                }
-
-                info!("Adding application flag {attr_name}");
-                let resource_id = resource_ids.get_res_id_or_none(attr_name);
-                attributes.push(mbf_axml::Attribute {
-                    name: attr_name.to_owned(),
-                    namespace: Some(mbf_axml::ANDROID_NS_URI.to_owned()),
-                    resource_id,
-                    value,
-                });
+    if let Event::StartElement { attributes, .. } = &mut events[application_index] {
+        for (attr_name, value) in [
+            ("debuggable", mbf_axml::AttributeValue::Boolean(true)),
+            (
+                "requestLegacyExternalStorage",
+                mbf_axml::AttributeValue::Boolean(true),
+            ),
+        ] {
+            if attributes.iter().any(|attr| attr.name == attr_name) {
+                debug!("Application flag {attr_name} already present, skipping");
+                continue;
             }
+
+            info!("Adding application flag {attr_name}");
+            let resource_id = resource_ids.get_res_id_or_none(attr_name);
+            attributes.push(mbf_axml::Attribute {
+                name: attr_name.to_owned(),
+                namespace: Some(mbf_axml::ANDROID_NS_URI.to_owned()),
+                resource_id,
+                value,
+            });
         }
     }
-
-    let _ = manifest_close_index;
 
     // Write the modified events back into (binary) AXML.
     let mut data_output = Cursor::new(Vec::new());
@@ -757,140 +744,6 @@ fn patch_manifest(zip: &mut ZipFile<std::fs::File>) -> Result<()> {
         .context("Writing modified manifest")?;
 
     Ok(())
-}
-
-/// Performs the LemonLoader manifest modifications on the given (readable) manifest XML.
-fn modify_manifest_xml(manifest_xml: String) -> Result<String> {
-    use std::collections::HashMap;
-    use xml::reader::XmlEvent as ReadEvent;
-    use xml::writer::XmlEvent as WriteEvent;
-
-    const ANDROID_NS: &str = mbf_axml::ANDROID_NS_URI;
-
-    let mut reader = xml::EventReader::new(Cursor::new(manifest_xml.as_bytes()));
-    let mut output = Vec::new();
-    let mut writer = xml::EmitterConfig::new()
-        .perform_indent(true)
-        .create_writer(Cursor::new(&mut output));
-
-    // Map of namespace prefix -> URI, representing the namespaces currently in scope.
-    let mut current_ns: HashMap<String, String> = HashMap::new();
-    // The prefix used for the `android` namespace, once the manifest element declares it.
-    let mut android_prefix: Option<String> = None;
-    // Permissions that already exist within the manifest.
-    let mut existing_permissions: HashSet<String> = HashSet::new();
-
-    loop {
-        match reader.next()? {
-            ReadEvent::StartElement { name, attributes, namespace } => {
-                // Work out which namespaces are newly declared with this element, so that
-                // they can be re-declared on the way out.
-                let newly_declared: Vec<(String, String)> = namespace
-                    .0
-                    .iter()
-                    .map(|(prefix, uri)| (prefix.as_str(), uri.as_str()))
-                    .filter(|(prefix, uri)| {
-                        !uri.is_empty()
-                            && *prefix != "xml"
-                            && current_ns.get(*prefix).map(|v| v.as_str()) != Some(*uri)
-                    })
-                    .map(|(prefix, uri)| (prefix.to_owned(), uri.to_owned()))
-                    .collect();
-
-                let mut builder = WriteEvent::start_element(name.borrow());
-                for (prefix, uri) in &newly_declared {
-                    builder = builder.ns(prefix.as_str(), uri.as_str());
-                    current_ns.insert(prefix.clone(), uri.clone());
-                }
-                for attribute in &attributes {
-                    builder = builder.attr(attribute.name.borrow(), attribute.value.as_str());
-                }
-
-                let local_name = name.local_name.as_str();
-                if local_name == "manifest" {
-                    android_prefix = Some(namespace
-                        .0
-                        .iter()
-                        .find_map(|(prefix, uri)| (uri.as_str() == ANDROID_NS).then(|| prefix.clone()))
-                        .ok_or_else(|| anyhow!("Manifest did not declare the android namespace"))?);
-                } else if local_name == "uses-permission" {
-                    if let Some(permission) = get_android_attr(&attributes, "name") {
-                        existing_permissions.insert(permission.to_owned());
-                    }
-                } else if local_name == "application" {
-                    let prefix = android_prefix
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("Application element came before the manifest element declared the android namespace"))?;
-                    let has_flag = |flag: &str| attributes.iter().any(|a| a.name.local_name == flag);
-                    if !has_flag("debuggable") {
-                        info!("Adding debuggable flag");
-                        builder = builder.attr(
-                            xml::name::Name::qualified("debuggable", ANDROID_NS, Some(prefix)),
-                            "true",
-                        );
-                    }
-                    if !has_flag("requestLegacyExternalStorage") {
-                        info!("Adding legacy external storage flag");
-                        builder = builder.attr(
-                            xml::name::Name::qualified(
-                                "requestLegacyExternalStorage",
-                                ANDROID_NS,
-                                Some(prefix),
-                            ),
-                            "true",
-                        );
-                    }
-                }
-
-                writer.write(builder)?;
-            }
-            ReadEvent::EndElement { name } => {
-                if name.local_name == "manifest" {
-                    // Add the standard permissions at the end of the manifest element,
-                    // mirroring the behaviour of the LemonLoader installer.
-                    let prefix = android_prefix.as_deref().ok_or_else(|| {
-                        anyhow!("Manifest element did not declare the android namespace")
-                    })?;
-
-                    for permission in STANDARD_PERMISSIONS {
-                        if existing_permissions.contains(permission) {
-                            debug!("Permission {permission} already present, skipping");
-                            continue;
-                        }
-
-                        info!("Adding permission {permission}");
-                        writer.write(
-                            WriteEvent::start_element("uses-permission").attr(
-                                xml::name::Name::qualified("name", ANDROID_NS, Some(prefix)),
-                                permission,
-                            ),
-                        )?;
-                        writer.write(WriteEvent::end_element())?;
-                    }
-                }
-
-                writer.write(WriteEvent::end_element())?;
-            }
-            ReadEvent::EndDocument => break,
-            _ => {}
-        }
-    }
-
-    Ok(String::from_utf8(output)?)
-}
-
-/// Gets the value of the attribute with the given name in the android namespace.
-fn get_android_attr<'a>(
-    attributes: &'a [xml::attribute::OwnedAttribute],
-    name: &str,
-) -> Option<&'a str> {
-    attributes
-        .iter()
-        .find(|attribute| {
-            attribute.name.namespace.as_deref() == Some(mbf_axml::ANDROID_NS_URI)
-                && attribute.name.local_name == name
-        })
-        .map(|attribute| attribute.value.as_str())
 }
 
 fn get_android_device_manufacturer() -> Result<String> {
@@ -937,86 +790,6 @@ mod tests {
         assert!(parse_unity_version_from_serialized_file(&data).is_err());
     }
 
-    #[test]
-    fn test_modify_manifest_xml() {
-        let input = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.StressLevelZero.BONELAB">
-    <uses-permission android:name="android.permission.INTERNET" />
-    <application android:label="BONELAB" />
-</manifest>"#;
-
-        let output = modify_manifest_xml(input.to_owned()).unwrap();
-
-        // All of the standard permissions should be added (with INTERNET not duplicated).
-        assert_eq!(output.matches("uses-permission").count(), 5);
-        for permission in STANDARD_PERMISSIONS {
-            assert!(output.contains(&format!("android:name=\"{permission}\"")));
-        }
-
-        // The application flags should be added.
-        assert!(output.contains("android:debuggable=\"true\""));
-        assert!(output.contains("android:requestLegacyExternalStorage=\"true\""));
-
-        // Existing attributes should be retained.
-        assert!(output.contains("android:label=\"BONELAB\""));
-        assert!(output.contains("package=\"com.StressLevelZero.BONELAB\""));
-
-        // The output should also compile back into (binary) AXML, as it will be
-        // put back into the APK.
-        let mut xml_reader = xml::EventReader::new(Cursor::new(output.as_bytes()));
-        let mut axml_output = Cursor::new(Vec::new());
-        let mut axml_writer = mbf_axml::AxmlWriter::new(&mut axml_output);
-        mbf_axml::xml_to_axml(&mut axml_writer, &mut xml_reader)
-            .expect("Modified manifest should compile back into AXML");
-        axml_writer.finish().expect("AXML should finish");
-
-        // Re-parse the AXML to check that the added attributes survived the round trip.
-        let axml_bytes = axml_output.into_inner();
-        let mut axml_cursor = Cursor::new(&axml_bytes);
-        let mut axml_reader = mbf_axml::AxmlReader::new(&mut axml_cursor).unwrap();
-        let mut permissions = 0;
-        let mut has_debuggable = false;
-        while let Some(event) = axml_reader.read_next_event().unwrap() {
-            match event {
-                mbf_axml::Event::StartElement { name, attributes, .. } => {
-                    if name == "uses-permission" {
-                        permissions += 1;
-                    } else if name == "application" {
-                        has_debuggable = attributes.iter().any(|attr| {
-                            attr.name == "debuggable"
-                                && attr.value == mbf_axml::AttributeValue::Boolean(true)
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(permissions, 5);
-        assert!(has_debuggable);
-    }
-
-    #[test]
-    fn test_modify_manifest_xml_keeps_existing_permissions_and_flags() {
-        let input = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.test">
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <application android:debuggable="true" />
-</manifest>"#;
-
-        let output = modify_manifest_xml(input.to_owned()).unwrap();
-        // 2 existing permissions are retained, the 3 missing standard permissions are added.
-        assert_eq!(output.matches("uses-permission").count(), 5);
-        assert_eq!(output.matches("uses-permission").count(), STANDARD_PERMISSIONS.len());
-        for permission in STANDARD_PERMISSIONS {
-            assert_eq!(
-                output.matches(&format!("android:name=\"{permission}\"")).count(),
-                1,
-                "permission {permission} should appear exactly once"
-            );
-        }
-        assert_eq!(output.matches("debuggable").count(), 1);
-    }
 
     #[test]
     fn test_loader_install_status() {
@@ -1220,6 +993,132 @@ mod tests {
         // The Unity version should still be readable from the patched APK.
         // (truncated to major.minor.patch, matching the UnityDependencies release tags)
         assert_eq!(get_unity_version(&mut apk_zip)?, "2022.3.22");
+
+        std::fs::remove_dir_all(&temp_dir)?;
+        Ok(())
+    }
+
+    // Regression test for the manifest patching: the patcher must edit the AXML
+    // directly, preserving the typed values and resource IDs of existing attributes.
+    // (The previous string round trip re-encoded the string-typed
+    // `compileSdkVersionCodename` as an integer, which Android's manifest parser
+    // rejects - the patched game froze on boot.)
+    #[test]
+    fn test_manifest_patching_preserves_types() -> anyhow::Result<()> {
+        use mbf_axml::{Attribute, AttributeValue, Event, Namespace, ANDROID_NS_URI};
+
+        let temp_dir = std::env::temp_dir().join("mbf_manifest_patch_test");
+        std::fs::create_dir_all(&temp_dir)?;
+        let apk_path = temp_dir.join("test.apk");
+
+        // Build a synthetic manifest: root with a STRING-typed compileSdkVersionCodename
+        // (as real aapt output has), plus an application element.
+        let mut manifest_axml = Vec::new();
+        {
+            let mut writer = mbf_axml::AxmlWriter::new(&mut manifest_axml);
+            writer.write_event(Event::StartNamespace(Namespace {
+                prefix: Some("android".to_owned()),
+                uri: ANDROID_NS_URI.to_owned(),
+            }));
+            writer.write_event(Event::StartElement {
+                attributes: vec![Attribute {
+                    name: "compileSdkVersionCodename".to_owned(),
+                    namespace: Some(ANDROID_NS_URI.to_owned()),
+                    resource_id: Some(0x01010573),
+                    value: AttributeValue::String("12".to_owned()),
+                }],
+                name: "manifest".to_owned(),
+                namespace: None,
+                line_num: 0,
+            });
+            writer.write_event(Event::StartElement {
+                attributes: vec![Attribute {
+                    name: "label".to_owned(),
+                    namespace: Some(ANDROID_NS_URI.to_owned()),
+                    resource_id: Some(0x01010001),
+                    value: AttributeValue::String("BONELAB".to_owned()),
+                }],
+                name: "application".to_owned(),
+                namespace: None,
+                line_num: 0,
+            });
+            writer.write_event(Event::EndElement {
+                line_num: 0,
+                namespace: None,
+                name: "application".to_owned(),
+            });
+            writer.write_event(Event::EndElement {
+                line_num: 0,
+                namespace: None,
+                name: "manifest".to_owned(),
+            });
+            writer.write_event(Event::EndNamespace(Namespace {
+                prefix: Some("android".to_owned()),
+                uri: ANDROID_NS_URI.to_owned(),
+            }));
+            writer.finish().context("Writing synthetic AXML")?;
+        }
+
+        write_test_zip(&apk_path, &[("AndroidManifest.xml", &manifest_axml)])?;
+
+        let file = OpenOptions::new().read(true).write(true).open(&apk_path)?;
+        let mut zip = ZipFile::open(file)?;
+        patch_manifest(&mut zip)?;
+        zip.save()?;
+
+        // Read the patched manifest back and check the attribute-level state.
+        let file = OpenOptions::new().read(true).open(&apk_path)?;
+        let mut zip = ZipFile::open(file)?;
+        let patched = zip.read_file("AndroidManifest.xml")?;
+
+        let mut cursor = Cursor::new(&patched);
+        let mut reader = mbf_axml::AxmlReader::new(&mut cursor)?;
+        let mut root_attrs: Vec<Attribute> = Vec::new();
+        let mut app_attrs: Vec<Attribute> = Vec::new();
+        let mut permission_values: Vec<String> = Vec::new();
+        while let Some(event) = reader.read_next_event()? {
+            match event {
+                Event::StartElement { name, attributes, .. } => match name.as_str() {
+                    "manifest" => root_attrs = attributes,
+                    "application" => app_attrs = attributes,
+                    "uses-permission" => {
+                        for attr in &attributes {
+                            if let AttributeValue::String(value) = &attr.value {
+                                permission_values.push(value.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        // 1. The STRING type of compileSdkVersionCodename must be preserved.
+        let codename = root_attrs
+            .iter()
+            .find(|attr| attr.name == "compileSdkVersionCodename")
+            .ok_or(anyhow!("compileSdkVersionCodename was lost"))?;
+        assert_eq!(
+            codename.value,
+            AttributeValue::String("12".to_owned()),
+            "string-typed attribute must not be re-encoded as an integer"
+        );
+
+        // 2. All standard permissions added as string-typed name attributes.
+        assert_eq!(permission_values.len(), STANDARD_PERMISSIONS.len());
+        for permission in STANDARD_PERMISSIONS {
+            assert!(permission_values.contains(&permission.to_owned()));
+        }
+
+        // 3. The application flags added as boolean-typed attributes.
+        for flag in ["debuggable", "requestLegacyExternalStorage"] {
+            let attr = app_attrs
+                .iter()
+                .find(|attr| attr.name == flag)
+                .ok_or_else(|| anyhow!("Application flag {flag} was not added"))?;
+            assert_eq!(attr.value, AttributeValue::Boolean(true));
+        }
 
         std::fs::remove_dir_all(&temp_dir)?;
         Ok(())
