@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Mod, trimGameVersion } from "../Models";
+import { Mod } from "../Models";
 import { Modal } from "./Modal";
 import { Adb } from '@yume-chan/adb';
 import { ModCard } from "./ModCard";
@@ -14,13 +14,12 @@ import { OptionsMenu } from "./OptionsMenu";
 import useFileDropper from "../hooks/useFileDropper";
 import { Log } from "../Logging";
 import { useSetWorking, useSyncStore, wrapOperation } from "../SyncStore";
-import { ModRepoMod } from "../ModsRepo";
+import { RepoMod } from "../ModsRepo";
 import { useDeviceStore } from "../DeviceStore";
 import SyncIcon from "../icons/sync.svg"
 
 
 interface ModManagerProps {
-    gameVersion: string,
     setMods: (mods: Mod[]) => void,
     modStatus: ModStatus,
     setModStatus: (status: ModStatus) => void,
@@ -32,32 +31,30 @@ enum SelectedMenu {
 }
 
 export function ModManager(props: ModManagerProps) {
-    const { modStatus, setModStatus, setMods, gameVersion, quit } = props;
+    const { modStatus, setModStatus, setMods, quit } = props;
     const mods = modStatus.installed_mods;
     const [menu, setMenu] = useState(SelectedMenu.add as SelectedMenu);
 
-    sortByNameAndIfCore(mods);
+    sortByName(mods);
 
     return <>
         <Title menu={menu} setMenu={setMenu}/>
-        
+
         {/* We use a style with display: none when hiding this menu, as this avoids remounting the component,
             which would fetch the mods index again. */}
 
         <AddModsMenu
             mods={mods}
             setMods={setMods}
-            gameVersion={gameVersion}
             visible={menu === SelectedMenu.add}
         />
-        
+
         <InstalledModsMenu
             mods={mods}
             setMods={setMods}
-            gameVersion={gameVersion}
             visible={menu === SelectedMenu.current}
         />
-        
+
         <OptionsMenu
             quit={quit}
             modStatus={modStatus}
@@ -94,14 +91,12 @@ function Title(props: TitleProps) {
 interface ModMenuProps {
     mods: Mod[],
     setMods: (mods: Mod[]) => void,
-    gameVersion: string,
     visible?: boolean
 }
 
 function InstalledModsMenu(props: ModMenuProps) {
     const { mods,
-        setMods,
-        gameVersion
+        setMods
     } = props;
     const { device } = useDeviceStore((state) => ({ device: state.device }));
     const [changes, setChanges] = useState({} as { [id: string]: boolean });
@@ -128,7 +123,6 @@ function InstalledModsMenu(props: ModMenuProps) {
 
 		<div className="mod-list">
 			{mods.map(mod => <ModCard
-				gameVersion={gameVersion}
 				mod={mod}
                 pendingChange={changes[mod.id]}
 				key={mod.id}
@@ -138,9 +132,9 @@ function InstalledModsMenu(props: ModMenuProps) {
                     await wrapOperation("Removing mod", "Failed to remove mod", async () => {
 						setMods(await removeMod(device, mod.id));
                         const newChanges = { ...changes };
-                        
+
                         delete newChanges[mod.id];
-                        
+
                         setChanges(newChanges);
                     });
 				}}
@@ -164,7 +158,7 @@ function InstalledModsMenu(props: ModMenuProps) {
 
 function UploadButton({ onUploaded }: { onUploaded: (files: File[]) => void}) {
     const inputFile = useRef<HTMLInputElement | null>(null);
-    return <button id="uploadButton" onClick={() => inputFile.current?.click()} title="Upload any .QMOD file, any song as a .ZIP, any Qosmetics files or any other file accepted by a particular mod.">
+    return <button id="uploadButton" onClick={() => inputFile.current?.click()} title="Upload any mod .DLL file, or a .ZIP archive containing one or more mod DLLs.">
         Upload Files
         <img src={UploadIcon}/>
         <input type="file"
@@ -184,7 +178,7 @@ function UploadButton({ onUploaded }: { onUploaded: (files: File[]) => void}) {
 }
 
 
-type ImportType = "Url" | "File" | "ModRepo";
+type ImportType = "Url" | "File" | "RepoMod";
 interface QueuedImport {
     type: ImportType
 }
@@ -199,9 +193,9 @@ interface QueuedUrlImport extends QueuedImport {
     type: "Url"
 }
 
-interface QueuedModRepoImport extends QueuedImport {
-    mod: ModRepoMod,
-    type: 'ModRepo',
+interface QueuedRepoModImport extends QueuedImport {
+    mod: RepoMod,
+    type: 'RepoMod',
 }
 
 const importQueue: QueuedImport[] = [];
@@ -210,12 +204,11 @@ let isProcessingQueue: boolean = false;
 function AddModsMenu(props: ModMenuProps) {
     const {
         mods,
-        setMods,
-        gameVersion
+        setMods
     } = props;
     const { device } = useDeviceStore((state) => ({ device: state.device }));
 
-    // Automatically installs a mod when it is imported, or warns the user if it isn't designed for the current game version.
+    // Automatically installs a mod when it is imported.
     // Gives appropriate toasts/reports errors in each case.
     async function onModImported(result: ImportedMod) {
         if (!device) return;
@@ -224,42 +217,30 @@ function AddModsMenu(props: ModMenuProps) {
         setMods(installed_mods);
 
         const imported_mod = installed_mods.find(mod => mod.id === imported_id)!;
-        const versionMismatch = imported_mod.game_version !== null &&gameVersion !== imported_mod.game_version;
-        if(versionMismatch) {
-            // Don't install a mod by default if its version mismatches: we want the user to understand the consequences
-            toast.error("The mod `" + imported_id + "` was not enabled automatically as it is not designed for game version v" 
-                + trimGameVersion(gameVersion) + ".", { autoClose: false });
-        }   else    {
-            try {
-                const result = await setModStatuses(device, { [imported_id]: true });
-                setMods(result.installed_mods);
+        try {
+            const result = await setModStatuses(device, { [imported_id]: true });
+            setMods(result.installed_mods);
 
-                // This is where typical mod install failures occur
-                if (result.failures !== null) {
-                    toast.error(result.failures, { autoClose: false });
-                }   else    {
-                    toast.success("Successfully downloaded and installed " + imported_mod.name + " v" + imported_mod.version)
-                }
-
-            }   catch(err) {
-                // If this occurs, it's a panic i.e. bug in the agent
-                toast.error(`Failed to install ${imported_id} after importing due to an internal error: ${err}`, { autoClose: false} );
+            // This is where typical mod install failures occur
+            if (result.failures !== null) {
+                toast.error(result.failures, { autoClose: false });
+            }   else    {
+                toast.success("Successfully installed " + imported_mod.name
+                    + (imported_mod.version !== null ? " v" + imported_mod.version : ""))
             }
+
+        }   catch(err) {
+            // If this occurs, it's a panic i.e. bug in the agent
+            toast.error(`Failed to enable ${imported_id} after importing due to an internal error: ${err}`, { autoClose: false} );
         }
     }
 
     // Processes an ImportResult
     async function onImportResult(importResult: ImportResult) {
-        const filename = importResult.used_filename;
         const typedResult = importResult.result;
-        if(typedResult.type === 'ImportedFileCopy') {
-            Log.info("Successfully copied " + filename + " to " + typedResult.copied_to + " due to request from " + typedResult.mod_id);
-            toast.success("Successfully copied " + filename + " to the path specified by " + typedResult.mod_id);
-        }   else if(typedResult.type === 'ImportedSong') {
-            toast.success("Successfully imported song " + filename);
-        }   else if(typedResult.type === 'NonQuestModDetected')  {
-            toast.error(`${importResult.used_filename} is a PC mod, with the .DLL file extension. You can only install Quest mods with the .QMOD file extension. Get these from the 'Add Mods' tab.`, { autoClose: false })
-        }   else    {
+        if(typedResult.type === 'NonModFile')  {
+            toast.error(`${importResult.used_filename} is not a mod: mods are .dll files, or .zip packages containing them.`, { autoClose: false })
+        } else {
             await onModImported(typedResult);
         }
     }
@@ -275,14 +256,14 @@ function AddModsMenu(props: ModMenuProps) {
         }
     }
 
-    async function handleUrlImport(url: string) {
+    async function handleUrlImport(url: string, repoPackage?: { id: string, name: string, version: string }) {
         if (!device) return;
         if (url.startsWith("file:///")) {
             toast.error("Cannot process dropped file from this source, drag from the file picker instead. (Drag from OperaGX file downloads popup does not work)");
             return;
         }
         try {
-            const importResult = await importUrl(device, url)
+            const importResult = await importUrl(device, url, repoPackage);
             await onImportResult(importResult);
         }   catch(e)   {
             toast.error(`Failed to import file: ${e}`);
@@ -298,7 +279,7 @@ function AddModsMenu(props: ModMenuProps) {
         if(isProcessingQueue) {
             return;
         }
-        
+
         // Otherwise, we must stop being lazy and process the queue ourselves.
         Log.debug("Now processing import queue");
         isProcessingQueue = true;
@@ -306,7 +287,7 @@ function AddModsMenu(props: ModMenuProps) {
         let disconnected = false;
         device.disconnected.then(() => disconnected = true);
         const setWorking = useSetWorking("Importing");
-        const { setStatusText } = useSyncStore.getState(); 
+        const { setStatusText } = useSyncStore.getState();
 
         setWorking(true);
         while(importQueue.length > 0 && !disconnected) {
@@ -322,12 +303,12 @@ function AddModsMenu(props: ModMenuProps) {
                 setStatusText(`Processing url ${url}`);
 
                 await handleUrlImport(url);
-            }   else if(newImport.type == "ModRepo") {
-                const mod = (newImport as QueuedModRepoImport).mod;
+            }   else if(newImport.type == "RepoMod") {
+                const mod = (newImport as QueuedRepoModImport).mod;
 
                 setStatusText(`Installing ${mod.name} v${mod.version}`);
 
-                await handleUrlImport(mod.download);
+                await handleUrlImport(mod.download, { id: mod.id, name: mod.name, version: mod.version });
             }
         }
         setWorking(false);
@@ -362,29 +343,20 @@ function AddModsMenu(props: ModMenuProps) {
                 return { type: "File", file: file };
             }))} />
 
-        <ModRepoBrowser existingMods={mods} gameVersion={gameVersion} visible={props.visible} onDownload={async mods => {
-            const modRepoImports: QueuedModRepoImport[] = mods.map(mod => { return {
-                type: "ModRepo",
+        <ModRepoBrowser existingMods={mods} visible={props.visible} onDownload={async mods => {
+            const repoImports: QueuedRepoModImport[] = mods.map(mod => { return {
+                type: "RepoMod",
                 mod
             }});
-            enqueueImports(modRepoImports);
+            enqueueImports(repoImports);
         }} />
     </div>
 }
 
 
-// Sorts mods by their ID alphabetically
-// Also sorts the mods so that core mods come last in the list.
-function sortByNameAndIfCore(mods: Mod[]) {
+// Sorts mods by their name alphabetically.
+function sortByName(mods: Mod[]) {
     mods.sort((a, b) => {
-        // Sort core mods after other mods
-        // This is so that user-installed mods are more obvious in the list.
-        if(!b.is_core && a.is_core) {
-            return 1;
-        }   else if(!a.is_core && b.is_core) {
-            return -1;
-        }
-        
         const nameA = a.name.toLowerCase().trim();
         const nameB = b.name.toLowerCase().trim();
 

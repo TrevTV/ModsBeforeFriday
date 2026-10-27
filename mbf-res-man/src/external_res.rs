@@ -1,98 +1,90 @@
-//! Collection of types used to read the BMBF resources repository to fetch core mod information.
-use crate::{
-    models::{Diff, DiffIndex, ModRepo, VersionedCoreMods},
-    res_cache::{JsonPullError, ResCache},
-};
-use anyhow::{anyhow, Context, Result};
-use log::info;
-use std::collections::HashMap;
+//! Module for fetching external resources used by MBF.
+//!
+//! Unlike the old (Beat Saber) versions of MBF, this tool no longer downloads core mods or
+//! version diffs. The only external resources needed are:
+//! - The latest LemonLoader (MelonLoader for Android) release, from which the `melon_data.zip`
+//!   asset is downloaded when patching.
+//! - The unstripped `libunity.so` for the game's Unity version, from the
+//!   MelonLoader.UnityDependencies repository.
 
-pub type CoreModIndex = HashMap<String, VersionedCoreMods>;
+use std::fs::File;
 
-const CORE_MODS_URL: &str =
-    "https://raw.githubusercontent.com/QuestPackageManager/bs-coremods/main/core_mods.json";
+use anyhow::{Context, Result};
+use serde::Deserialize;
 
-pub fn fetch_core_mods(
-    res_cache: &ResCache,
-    override_core_mod_url: Option<String>,
-) -> Result<CoreModIndex, JsonPullError> {
-    match override_core_mod_url {
-        Some(url) => {
-            info!("Using overridden core mod URL");
-            // TODO: The override core mod URL should NOT cache
-            res_cache.get_json_cached(&url, "core_mods_override.json")
-        }
-        None => res_cache.get_json_cached(CORE_MODS_URL, "core_mods.json"),
-    }
+use crate::res_cache::ResCache;
+
+const MELONLOADER_RELEASE_INFO_URL: &str =
+    "https://api.github.com/repos/LemonLoader/MelonLoader/releases/latest";
+
+const UNITY_DEPS_URL_TEMPLATE: &str =
+    "https://github.com/LavaGang/MelonLoader.UnityDependencies/releases/download/{0}/libunity.so.arm64-v8a";
+const CHINA_UNITY_DEPS_URL_TEMPLATE: &str =
+    "https://github.com/LemonLoader/MelonLoader.UnityDependencies.China/releases/download/{0}/libunity.so.arm64-v8a";
+
+/// The subset of the GitHub release JSON that MBF needs.
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubAsset>,
 }
 
-const UNITY_INDEX_URL: &str =
-    "https://raw.githubusercontent.com/Lauriethefish/QuestUnstrippedUnity/main/index.json";
-const UNITY_VER_FORMAT: &str =
-    "https://raw.githubusercontent.com/Lauriethefish/QuestUnstrippedUnity/main/versions/{0}.so";
+#[derive(Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
 
-pub fn get_libunity_url(
-    res_cache: &ResCache,
-    apk_id: &str,
-    version: &str,
-) -> Result<Option<String>> {
-    // Contains an entry for each app supported by the index, which contains an entry for each version of that app.
-    let unity_index: HashMap<String, HashMap<String, String>> =
-        res_cache.get_json_cached(UNITY_INDEX_URL, "libunity_index.json")?;
+/// Information about the latest LemonLoader (MelonLoader) release.
+pub struct MelonLoaderRelease {
+    /// The release tag, e.g. `0.6.5.1`.
+    pub tag: String,
+    /// The URL of the `melon_data.zip` asset within the release.
+    pub melon_data_url: String,
+}
 
-    let app_index = match unity_index.get(apk_id) {
-        Some(app_index) => app_index,
-        None => return Ok(None),
+/// Fetches information about the latest LemonLoader (MelonLoader) release.
+///
+/// The release info is fetched through the given resource cache, which will make use of a
+/// locally cached copy of the release info when possible.
+pub fn get_latest_melonloader_release(res_cache: &ResCache) -> Result<MelonLoaderRelease> {
+    let release: GitHubRelease = res_cache
+        .get_json_cached(MELONLOADER_RELEASE_INFO_URL, "melonloader_release.json")
+        .map_err(|err| match err {
+            crate::res_cache::JsonPullError::FetchError(err) => err,
+            crate::res_cache::JsonPullError::ParseError(err) => err.into(),
+        })
+        .context("Fetching LemonLoader release info")?;
+
+    let melon_data_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.starts_with("melon_data"))
+        .ok_or(anyhow::anyhow!(
+            "The latest LemonLoader release did not contain a melon_data asset"
+        ))?;
+
+    Ok(MelonLoaderRelease {
+        tag: release.tag_name,
+        melon_data_url: melon_data_asset.browser_download_url.clone(),
+    })
+}
+
+/// Gets the URL to download the unstripped `libunity.so` for the given Unity version from.
+///
+/// Unity "China" versions (e.g. `2021.3.16c1`) have their dependencies generated in a separate
+/// repository, matching the behaviour of the LemonLoader installer.
+pub fn get_unity_deps_url(unity_version: &str) -> String {
+    let is_china = unity_version.contains('c');
+    let template = if is_china {
+        CHINA_UNITY_DEPS_URL_TEMPLATE
+    } else {
+        UNITY_DEPS_URL_TEMPLATE
     };
-    match app_index.get(version) {
-        Some(unity_version) => Ok(Some(UNITY_VER_FORMAT.replace("{0}", &unity_version))),
-        None => Ok(None),
-    }
+
+    template.replace("{0}", unity_version)
 }
 
-/// The next section contains the methods used to access the diffs needed to downgrade.
-/// MBF only supports downgrading from the latest version to latest moddable, but this implementation does support having a diff from any version to any other version.
-
-/// We just use one github release with a JSON file attached to it that explains the content of the other files attached,
-/// since there is no quota on the total size of a release.
-
-const DIFF_INDEX_STEM: &str = "https://github.com/Lauriethefish/mbf-diffs/releases/download/1.0.0";
-
-pub fn get_diff_index(res_cache: &ResCache) -> Result<DiffIndex, JsonPullError> {
-    res_cache.get_json_cached(&format!("{DIFF_INDEX_STEM}/index.json"), "diff_index.json")
-}
-
-pub fn get_diff_url(diff: &Diff) -> String {
-    format!("{DIFF_INDEX_STEM}/{}", diff.diff_name)
-}
-
-const MANIFEST_FORMAT: &str =
-    "https://github.com/Lauriethefish/mbf-manifests/releases/download/1.0.0/{0}.xml";
-
-// Downloads the AndroidManifest.xml file for the given Beat Saber version (in AXML format) and returns it to the frontend.
-pub fn get_manifest_axml(agent: &ureq::Agent, version: String) -> Result<Vec<u8>> {
-    let manifest_url = MANIFEST_FORMAT.replace("{0}", &version);
-
-    let resp = agent
-        .get(&manifest_url)
-        .call()
-        .context("Fetching manifest for BS ver")?;
-
-    if resp.status() == 404 {
-        return Err(anyhow!("Could not find an AXML manifest for version {version} (404). Report this so that one can be added"));
-    }
-
-    let mut buffer = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut buffer)
-        .context("Reading response")?;
-
-    Ok(buffer)
-}
-
-const MOD_REPO_URL: &str = "https://mods.bsquest.xyz/mods.json";
-
-/// Gets the mods repository used to search for dependency download URLs.
-pub fn get_mod_repo(res_cache: &ResCache) -> Result<ModRepo> {
-    Ok(res_cache.get_json_cached(MOD_REPO_URL, "mod_repo.json")?)
-}
+/// NB: Kept for convenience; a File is returned by the resource cache for large downloads
+/// so that they can be streamed without being loaded into memory.
+pub type CachedFile = File;

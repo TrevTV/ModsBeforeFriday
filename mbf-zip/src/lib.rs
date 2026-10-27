@@ -73,6 +73,11 @@ pub struct ZipFile<T: Read + Seek> {
     // memory, improving performance.
     // Typically, already-compressed media files like PNG use the STORE compression method.
     store_aligment: u16,
+    // Whether any entries have been deleted since the archive was opened.
+    // If so, the archive must be compacted on save, so that the raw bytes of deleted
+    // entries (which are not removed by [ZipFile::delete_file]) do not remain within
+    // the final archive.
+    dirty: bool,
 }
 
 impl<T: Read + Seek> ZipFile<T> {
@@ -131,17 +136,26 @@ impl<T: Read + Seek> ZipFile<T> {
         // Read the last LFH to figure out the location of the first byte after the last entry.
         // We could just use the central directory offset here, however this will leave the original signature intact,
         // ... which may not cause any problems but is a waste of space.
-        buf_file.seek(SeekFrom::Start(last_lfh_offset as u64))?;
-        let last_header = LocalFileHeader::read(&mut buf_file)?;
+        // NB: An archive with no entries has no LFH to read, so the first byte after the
+        // "last entry" is simply the start of the archive.
+        let end_of_entries_offset: u32 = if eocd.cent_dir_records == 0 {
+            0
+        } else {
+            buf_file.seek(SeekFrom::Start(last_lfh_offset as u64))?;
+            let last_header = LocalFileHeader::read(&mut buf_file)?;
 
-        Ok(Self {
-            end_of_entries_offset: (buf_file.stream_position()?
+            (buf_file.stream_position()?
                 + last_header.compressed_len as u64)
                 .try_into()
-                .context("ZIP file too large")?,
+                .context("ZIP file too large")?
+        };
+
+        Ok(Self {
+            end_of_entries_offset,
             file,
             entries,
             store_aligment: 1,
+            dirty: false,
         })
     }
 
@@ -333,6 +347,18 @@ impl<T: Read + Seek> ZipFile<T> {
     pub fn contains_file(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
+
+    /// Gets the file offset of the *data* of the entry with the given name
+    /// (i.e. the first byte after its local file header).
+    /// Android R+ requires the data of `resources.arsc` to be 4-byte aligned.
+    pub fn get_data_offset(&self, name: &str) -> Option<u64> {
+        self.entries.get(name).map(|cd_header| {
+            cd_header.local_header_offset as u64
+                + 30
+                + cd_header.file_name.len() as u64
+                + cd_header.extra_field.len() as u64
+        })
+    }
 }
 
 // Copies the contents of `from` to `to`, calculating the ZIP CRC-32 of the copied data.
@@ -508,11 +534,140 @@ impl ZipFile<File> {
 
     // Deletes the file with the given name from the ZIP, if it existed.
     pub fn delete_file(&mut self, name: &str) -> bool {
-        self.entries.remove(name).is_some()
+        if self.entries.remove(name).is_some() {
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Saves the ZIP central directory, while signing the APK with the V2 signature scheme.
+    /// Compacts the archive by physically removing the raw bytes of any entries that are
+    /// no longer referenced by the central directory (i.e. entries removed via
+    /// [ZipFile::delete_file], whose local file header and data would otherwise remain
+    /// within the archive as unreachable garbage).
+    ///
+    /// This matters for APKs: tooling such as Android's package installer may rely on a
+    /// replaced library (e.g. a mod loader's `libmain.so`) appearing exactly once within
+    /// the archive, rather than the original library still being present after it.
+    ///
+    /// Entries are kept in their original order, and STORE-method entries keep their
+    /// alignment (via `store_aligment`), so that they can still be mmap'd directly.
+    fn compact_entries(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+
+        // Sort entries by their current position within the archive, so that the
+        // compaction is a stable, in-place rewrite (each destination position is always
+        // at or before its source position).
+        let mut sorted: Vec<CentDirHeader> =
+            self.entries.values().cloned().collect();
+        sorted.sort_by_key(|cdh| cdh.local_header_offset);
+
+        let mut write_pos: u64 = 0;
+        for cd_header in sorted.iter_mut() {
+            let old_offset = cd_header.local_header_offset as u64;
+
+            // Read the entry's original local file header.
+            self.file.seek(SeekFrom::Start(old_offset))?;
+            let lfh = LocalFileHeader::read(&mut self.file)?;
+            let old_header_len = (30 + lfh.file_name.len() + lfh.extra_field.len()) as u64;
+
+            // STORE entries must keep their *data* on a 4-byte boundary (required by
+            // Android R+ for resources.arsc, and desirable for mmap'ing libraries).
+            // The data start depends on the LFH length, so alignment is achieved by
+            // rebuilding the LFH with a resized extra field, rather than by shifting
+            // the entry.
+            let (aligned_lfh, header_len) =
+                if cd_header.compression_method == FileCompression::Store {
+                    let mut rebuilt = lfh.clone();
+                    rebuilt.extra_field = self
+                        .create_alignment_field(write_pos + 30 + rebuilt.file_name.len() as u64)?;
+                    let header_len =
+                        (30 + rebuilt.file_name.len() + rebuilt.extra_field.len()) as u64;
+                    (Some(rebuilt), header_len)
+                } else {
+                    (None, old_header_len)
+                };
+
+            match aligned_lfh {
+                // STORE entry: write the rebuilt (aligned) LFH, then copy only the data.
+                Some(rebuilt) => {
+                    self.file.seek(SeekFrom::Start(write_pos))?;
+                    rebuilt
+                        .write(&mut self.file)
+                        .context("Writing aligned local file header")?;
+                    Self::copy_file_range(
+                        &mut self.file,
+                        old_offset + old_header_len,
+                        cd_header.compressed_len as u64,
+                        write_pos + header_len,
+                    )
+                    .with_context(|| format!("Compacting entry {}", cd_header.file_name))?;
+                }
+                // Uncompressed-copy the header + data verbatim.
+                None => {
+                    Self::copy_file_range(
+                        &mut self.file,
+                        old_offset,
+                        old_header_len + cd_header.compressed_len as u64,
+                        write_pos,
+                    )
+                    .with_context(|| format!("Compacting entry {}", cd_header.file_name))?;
+                }
+            }
+
+            cd_header.local_header_offset = write_pos
+                .try_into()
+                .context("Compacted ZIP file too big")?;
+            write_pos += header_len + cd_header.compressed_len as u64;
+        }
+
+        // Write the updated (compacted) offsets back into the central directory map.
+        self.entries = sorted
+            .into_iter()
+            .map(|cd_header| (cd_header.file_name.clone(), cd_header))
+            .collect();
+
+        self.file.set_len(write_pos)?;
+        self.end_of_entries_offset = write_pos.try_into().context("ZIP file too large")?;
+        self.dirty = false;
+
+        Ok(())
+    }
+
+    /// Copies `len` bytes from offset `from` to offset `to` within the same file.
+    /// The destination must be at or before the source position.
+    fn copy_file_range(file: &mut File, from: u64, len: u64, to: u64) -> Result<()> {
+        if to == from {
+            return Ok(());
+        }
+
+        const CHUNK_SIZE: usize = 1024 * 1024;
+        let mut buffer = vec![0u8; CHUNK_SIZE.min(len as usize)];
+
+        let mut remaining = len;
+        let (mut src, mut dst) = (from, to);
+        while remaining > 0 {
+            let chunk = buffer.len().min(remaining as usize);
+            file.seek(SeekFrom::Start(src))?;
+            file.read_exact(&mut buffer[..chunk])?;
+            file.seek(SeekFrom::Start(dst))?;
+            file.write_all(&buffer[..chunk])?;
+
+            src += chunk as u64;
+            dst += chunk as u64;
+            remaining -= chunk as u64;
+        }
+
+        Ok(())
+    }
+
     pub fn save_and_sign_v2(&mut self, priv_key: &RsaPrivateKey, cert: &Certificate) -> Result<()> {
+        self.compact_entries()?;
+
         let mut cd_bytes = Vec::new();
         let mut cd_cursor = Cursor::new(&mut cd_bytes);
 
@@ -560,6 +715,8 @@ impl ZipFile<File> {
     /// Currently, this project doesn't save any ZIP files without signing them, but this is kept in-case this is needed in the future.
     #[allow(unused)]
     pub fn save(mut self) -> Result<()> {
+        self.compact_entries()?;
+
         // Remove existing CD and EOCD
         self.file.set_len(self.end_of_entries_offset as u64)?;
 
@@ -588,5 +745,95 @@ impl ZipFile<File> {
         eocd.write(&mut self.file)
             .context("Saving end of central directory")?;
         return Ok(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Cursor as TestCursor;
+
+    /// Verifies that deleting an entry and saving physically removes its bytes from the
+    /// archive, rather than leaving the original entry as unreachable garbage.
+    /// This matters for APKs, where a replaced native library (e.g. a mod loader's
+    /// `libmain.so`) must appear exactly once.
+    #[test]
+    fn test_compaction_removes_deleted_entries() -> Result<()> {
+        let temp_path = std::env::temp_dir().join("mbf_compaction_test.apk");
+        std::fs::remove_file(&temp_path).ok();
+
+        // An empty ZIP archive: just an EOCD record with no entries, which ZipFile::open
+        // can accept as a base for writing new entries into.
+        let empty_eocd: [u8; 22] = [
+            0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        std::fs::write(&temp_path, &empty_eocd)?;
+
+        // Create an archive: entry_a (which will be deleted), entry_b, a resources.arsc-style
+        // STORE entry, and entry_c (which will be replaced).
+        {
+            let file = OpenOptions::new().create(true).write(true).read(true).open(&temp_path)?;
+            let mut zip = ZipFile::open(file)?;
+            zip.set_store_alignment(4);
+            zip.write_file("removal_marker_a", &mut TestCursor::new(vec![1u8; 4096]), FileCompression::Deflate)?;
+            zip.write_file("kept_entry_b", &mut TestCursor::new(vec![2u8; 2048]), FileCompression::Deflate)?;
+            zip.write_file("resources.arsc", &mut TestCursor::new(vec![5u8; 1000]), FileCompression::Store)?;
+            zip.write_file("lib/arm64-v8a/libreplaced.so", &mut TestCursor::new(vec![3u8; 8192]), FileCompression::Deflate)?;
+            zip.save()?;
+        }
+
+        // Delete + replace, then save again.
+        {
+            let file = OpenOptions::new().read(true).write(true).open(&temp_path)?;
+            let mut zip = ZipFile::open(file)?;
+            assert!(zip.delete_file("removal_marker_a"));
+            zip.delete_file("lib/arm64-v8a/libreplaced.so");
+            zip.write_file("lib/arm64-v8a/libreplaced.so", &mut TestCursor::new(vec![4u8; 4096]), FileCompression::Deflate)?;
+            zip.save()?;
+        }
+
+        // The archive must no longer contain the deleted entry, and its raw bytes must
+        // be physically gone (the name only appears where a live entry references it).
+        let raw = std::fs::read(&temp_path)?;
+        let count_occurrences = |haystack: &[u8], needle: &str| -> usize {
+            haystack.windows(needle.len()).filter(|w| w == &needle.as_bytes()).count()
+        };
+        assert_eq!(
+            count_occurrences(&raw, "removal_marker_a"),
+            0,
+            "deleted entry must be physically removed from the archive"
+        );
+
+        // The kept + replaced entries must still read back correctly.
+        let file = OpenOptions::new().read(true).open(&temp_path)?;
+        let mut zip = ZipFile::open(file)?;
+        assert!(!zip.contains_file("removal_marker_a"));
+        assert!(zip.contains_file("kept_entry_b"));
+        assert!(zip.contains_file("lib/arm64-v8a/libreplaced.so"));
+        assert_eq!(zip.read_file("kept_entry_b")?, vec![2u8; 2048]);
+        assert_eq!(zip.read_file("lib/arm64-v8a/libreplaced.so")?, vec![4u8; 4096]);
+
+        // The replaced library must appear exactly twice in the raw stream (local file
+        // header + central directory), i.e. no orphaned copies of the old library.
+        assert_eq!(
+            count_occurrences(&raw, "lib/arm64-v8a/libreplaced.so"),
+            2,
+            "replaced entry must appear exactly once (LFH + CD), with no orphaned copy"
+        );
+
+        // resources.arsc-style STORE entries must have their DATA on a 4-byte boundary
+        // after compaction (Android R+ rejects the APK otherwise).
+        let file = OpenOptions::new().read(true).open(&temp_path)?;
+        let zip = ZipFile::open(file)?;
+        let data_offset = zip.get_data_offset("resources.arsc").expect("resources.arsc present");
+        assert_eq!(
+            data_offset % 4,
+            0,
+            "resources.arsc data must be 4-byte aligned after compaction"
+        );
+
+        std::fs::remove_file(&temp_path).ok();
+        Ok(())
     }
 }

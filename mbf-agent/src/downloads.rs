@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use log::{error, info, warn};
 use std::{
     fs::OpenOptions,
-    io::{self, Cursor, Read, Seek, Write},
+    io::{self, Read, Seek, Write},
     path::Path,
     time::Instant,
 };
@@ -283,13 +283,19 @@ pub fn download_file_with_attempts(
     download_with_attempts(cfg, writer, url)
 }
 
-/// Attempts to download a file from `url` to a Vec with multiple attempts, progress
-/// reporting, and resuming of failed downloads.
-/// Upon success, returns the filename supplied by the server, or None if no filename was supplied.
-/// If all attempts fail, the error from the last request is returned.
-pub fn download_to_vec_with_attempts(cfg: &DownloadConfig, url: &str) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    download_with_attempts(cfg, Cursor::new(&mut output), url)?;
+/// Performs a HEAD request to check whether a file exists at the given URL,
+/// without downloading its contents.
+/// Returns false if the server responded with an error status (e.g. a 404).
+pub fn check_url_exists(cfg: &DownloadConfig, url: &str) -> Result<bool> {
+    let resp = cfg
+        .ureq_agent
+        .head(url)
+        .call()
+        .map_err(|err| match err {
+            ureq::Error::Status(code, _) => anyhow::anyhow!("Request failed as got status {code} from server."),
+            ureq::Error::Transport(transport_err) => anyhow::Error::new(transport_err),
+        })
+        .context("Making HEAD request")?;
 
-    Ok(output)
+    Ok(resp.status() == 200)
 }

@@ -1,2 +1,2 @@
-export const gameId = new URLSearchParams(window.location.search).get("game_id") || "com.beatgames.beatsaber"
+export const gameId = new URLSearchParams(window.location.search).get("game_id") || "com.StressLevelZero.BONELAB"
 export const ignorePackageId = new URLSearchParams(window.location.search).get("ignore_package_id") == "true"

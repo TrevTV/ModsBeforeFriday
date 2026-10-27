@@ -1,33 +1,29 @@
-interface Mod {
+export interface Mod {
     id: string,
     name: string,
-    description: string | null,
+    version: string | null,
+    repo_id: string | null,
+    is_enabled: boolean
+}
+
+export type ModLoader = "MelonLoader" | "Unknown";
+
+export type InstallStatus = "Ready" | "NeedUpdate" | "Missing";
+
+export interface AppInfo {
     version: string,
-    is_enabled: boolean,
-    game_version: string | null
-    is_core: boolean
+    obb_present: boolean,
+    loader_installed: ModLoader | null,
+    installed_loader_version: string | null,
+    unity_version: string | null,
+    unity_deps_available: boolean
 }
 
-interface CoreMod {
-    id: string,
-    downloadLink: string,
-    verison: string
+export interface LoaderInfo {
+    latest_version: string,
+    install_status: InstallStatus
 }
 
-interface VersionedCoreMods {
-    mods: [CoreMod]
-}
+export type LogLevel = "Error" | "Warn" | "Info" | "Debug" | "Trace";
 
-type CoreModIndex = { [version: string]: VersionedCoreMods }
-
-export type {
-    Mod,
-    CoreMod,
-    VersionedCoreMods,
-    CoreModIndex
-}
-
-// Removes the build number, i.e. `_<big number>` suffix from the given game version.
-export function trimGameVersion(gameVersion: string): string {
-    return gameVersion.split("_")[0];
-}
+export {}

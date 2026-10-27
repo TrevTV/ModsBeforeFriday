@@ -3,10 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::{
-    mod_man::ModManager,
-    models::response::{ModModel, Response},
-};
+use crate::models::response::Response;
 use anyhow::{Context, Result};
 use log::info;
 
@@ -15,39 +12,35 @@ use log::info;
 /// # Returns
 /// The [Response] to the request (variant `ModSyncResult`)
 pub(super) fn handle_set_mods_enabled(statuses: HashMap<String, bool>) -> Result<Response> {
-    let res_cache = crate::load_res_cache()?;
-
-    let mut mod_manager = ModManager::new(super::get_app_version_only()?, &res_cache);
-    mod_manager.load_mods().context("Loading installed mods")?;
+    let mut mod_manager = super::load_mod_manager()?;
 
     let mut error = String::new();
 
-    for (id, new_status) in statuses {
-        let mod_rc = match mod_manager.get_mod(&id) {
-            Some(m) => m,
+    for (file_name, new_status) in statuses {
+        let already_enabled = match mod_manager.get_mod(&file_name) {
+            Some(m) => m.is_enabled,
             None => {
-                error.push_str(&format!("Mod with ID {id} did not exist\n"));
+                error.push_str(&format!("Mod with ID {file_name} did not exist\n"));
                 continue;
             }
         };
 
-        let already_installed = mod_rc.borrow().installed();
-        if new_status && !already_installed {
-            match mod_manager.install_mod(&id) {
-                Ok(_) => info!("Installed {id}"),
-                Err(err) => error.push_str(&format!("Failed to install {id}: {err}\n")),
+        if new_status && !already_enabled {
+            match mod_manager.set_mod_enabled(&file_name, true) {
+                Ok(_) => info!("Enabled {file_name}"),
+                Err(err) => error.push_str(&format!("Failed to enable {file_name}: {err:#}\n")),
             }
-        } else if !new_status && already_installed {
-            match mod_manager.uninstall_mod(&id) {
-                Ok(_) => info!("Uninstalled {id}"),
-                Err(err) => error.push_str(&format!("Failed to install {id}: {err}\n")),
+        } else if !new_status && already_enabled {
+            match mod_manager.set_mod_enabled(&file_name, false) {
+                Ok(_) => info!("Disabled {file_name}"),
+                Err(err) => error.push_str(&format!("Failed to disable {file_name}: {err:#}\n")),
             }
         }
     }
 
     Ok(Response::ModSyncResult {
-        installed_mods: get_mod_models(mod_manager)?,
-        failures: if error.len() > 0 {
+        installed_mods: super::get_mod_models(mod_manager)?,
+        failures: if !error.is_empty() {
             if error.ends_with('\n') {
                 error.pop();
             }
@@ -64,26 +57,10 @@ pub(super) fn handle_set_mods_enabled(statuses: HashMap<String, bool>) -> Result
 /// # Returns
 /// The [Response] to the request (variant `Mods`)
 pub(super) fn handle_remove_mod(id: String) -> Result<Response> {
-    let res_cache = crate::load_res_cache()?;
-    let mut mod_manager = ModManager::new(super::get_app_version_only()?, &res_cache);
-    mod_manager.load_mods()?;
-    mod_manager.remove_mod(&id)?;
+    let mut mod_manager = super::load_mod_manager()?;
+    mod_manager.remove_mod(&id).context("Removing mod")?;
 
     Ok(Response::Mods {
-        installed_mods: get_mod_models(mod_manager)?,
+        installed_mods: super::get_mod_models(mod_manager)?,
     })
-}
-
-/// Consumes a [ModManager] and converts the loaded mods into [ModModels](ModModel) which can be serialized
-/// to JSON and sent back to the frontend.
-pub(super) fn get_mod_models(mut mod_manager: ModManager) -> Result<Vec<ModModel>> {
-    // A dependency of one mod may have been installed in a modding operation.
-    // That mod is now therefore considered installed, even though it wasn't when the mods were loaded.
-    // Therefore, check dependencies of mods again to double-check which are really installed.
-    mod_manager.check_mods_installed()?;
-
-    Ok(mod_manager
-        .get_mods()
-        .map(|mod_info| ModModel::from(&*(**mod_info).borrow()))
-        .collect())
 }

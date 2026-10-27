@@ -7,8 +7,6 @@ import '@fontsource/roboto/400.css';
 import '@fontsource/roboto/500.css';
 import '@fontsource/roboto/700.css';
 
-import { updateBackgroundVisibility } from "./AnimatedBackground";
-
 export const SourceUrl: string = "https://github.com/Lauriethefish/ModsBeforeFriday";
 
 const root = ReactDOM.createRoot(
@@ -17,8 +15,6 @@ const root = ReactDOM.createRoot(
 root.render(
   <App />
 );
-
-updateBackgroundVisibility();
 
 // If you want to start measuring performance in your app, pass a function
 // to log results (for example: reportWebVitals(console.log))

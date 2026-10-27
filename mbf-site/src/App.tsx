@@ -1,5 +1,5 @@
 /// <reference types="w3c-web-usb" />
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import './css/App.css';
 import { AdbDaemonWebUsbConnection, AdbDaemonWebUsbDevice, AdbDaemonWebUsbDeviceManager } from '@yume-chan/adb-daemon-webusb';
@@ -11,7 +11,7 @@ import { cancelConfirmations, ConfirmationModal, ErrorModal } from './components
 import { Bounce, toast, ToastContainer } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 import { CornerMenu } from './components/CornerMenu';
-import { installLoggers, setCoreModOverrideUrl } from './Agent';
+import { installLoggers } from './Agent';
 import { Log } from './Logging';
 import { OperationModals } from './components/OperationModals';
 import { OpenLogsButton } from './components/OpenLogsButton';
@@ -21,8 +21,6 @@ import { SourceUrl } from '.';
 import { useDeviceStore } from './DeviceStore';
 
 type NoDeviceCause = "NoDeviceSelected" | "DeviceInUse";
-
-const NON_LEGACY_ANDROID_VERSION: number = 11;
 
 async function connect(
   setAuthing: () => void): Promise<Adb | NoDeviceCause> {
@@ -80,14 +78,13 @@ function ChooseDevice() {
   const [connectError, setConnectError] = useState(null as string | null);
   const [deviceInUse, setDeviceInUse] = useState(false);
   const {
-    devicePreV51, setDevicePreV51,
     device: chosenDevice, setDevice: setChosenDevice,
     androidVersion, setAndroidVersion
   } = useDeviceStore();
 
   if(chosenDevice !== null) {
     return <>
-      <DeviceModder device={chosenDevice} devicePreV51={devicePreV51} quit={(err) => {
+      <DeviceModder device={chosenDevice} quit={(err) => {
         if(err != null) {
           setConnectError(String(err));
         }
@@ -114,7 +111,7 @@ function ChooseDevice() {
         <div className="container mainContainer">
           <Title />
           <p>To get started, plug your Quest in with a USB-C cable and click the button below.</p>
-          <p>Want see what mods are available? You can find a full list <a href="https://mods.bsquest.xyz" target="_blank" rel="noopener noreferrer">here!</a></p>
+          <p>Want see what mods are available? You can find a full list <a href="https://thunderstore.io/c/bonelab/" target="_blank" rel="noopener noreferrer">here!</a></p>
 
           <NoCompatibleDevices />
 
@@ -137,12 +134,6 @@ function ChooseDevice() {
                   setAndroidVersion(androidVersion);
 
                   Log.debug("Device android version: " + androidVersion);
-
-                  const deviceName = device.banner.model;
-                  if (deviceName === "Quest") {
-                    Log.debug("Device is a Quest 1, switching to pre-v51 mode");
-                    setDevicePreV51(androidVersion < NON_LEGACY_ANDROID_VERSION);                  
-                  }
 
                   setAuthing(false);
                   setChosenDevice(device);
@@ -215,69 +206,23 @@ function DeviceInUse() {
 function Title() {
   return <>
     <h1>
-      <span className="initial">M</span>
-      <span className="title">ods</span>
       <span className="initial">B</span>
-      <span className="title">efore</span>
-      <span className="initial">F</span>
-      <span className="title">riday</span>
-      <span className="initial">!</span>
-      <p className="williamGay">william gay</p>
+      <span className="title">ONELAB</span>
+      <span className="initial"> L</span>
+      <span className="title">emonifier</span>
     </h1>
     <a href={SourceUrl} target="_blank" rel="noopener noreferrer" className="mobileOnly">Source Code</a>
-    <p>The easiest way to install custom songs for Beat Saber on Quest!</p>
+    <p>The easiest way to install mods for BONELAB on Quest!</p>
   </>
 }
 
-function ChooseCoreModUrl({ setSpecifiedCoreMods } : { setSpecifiedCoreMods: () => void}) {
-  const inputFieldRef = useRef<HTMLInputElement | null>(null);
-
-  return <div className='container mainContainer'>
-    <h1>Manually override core mod JSON</h1>
-    <p>Please specify a complete URL to the raw contents of your core mod JSON</p>
-    <input type="text" ref={inputFieldRef}/>
-    <br/><br/>
-    <button onClick={() => {
-      if(inputFieldRef.current !== null) {
-        const inputField = inputFieldRef.current;
-        Log.warn("Overriding core mods URL to " + inputField.value)
-        setCoreModOverrideUrl(inputField.value);
-        const searchParams = new URLSearchParams(window.location.search);
-        searchParams.set("setcores", inputField.value);
-        window.history.replaceState({}, "ModsBeforeThursday", "?" + searchParams.toString());
-
-        setSpecifiedCoreMods();
-      }
-    }}>
-      Confirm URL
-    </button>
-  </div>
-}
-
 function AppContents() {
-  const [ hasSetCoreUrl, setSetCoreUrl ] = useState(false);
-
-  const overrideQueryParam: string | null = new URLSearchParams(window.location.search).get("setcores");
-  let mustEnterUrl = false;
-  if(overrideQueryParam !== "prompt" && overrideQueryParam !== null) {
-    if(!hasSetCoreUrl) {
-      Log.warn("Setting core mod URL to " + overrideQueryParam);
-      setCoreModOverrideUrl(overrideQueryParam);
-      setSetCoreUrl(true);
-    }
-  } else if(overrideQueryParam !== null) {
-    Log.debug("Prompting user to specify core mod URL");
-    mustEnterUrl = true;
-  }
-
   if (usingOculusBrowser()) {
     return <OculusBrowserMessage />
   } else  if (navigator.usb === undefined) {
     return <UnsupportedMessage />
-  } else if (hasSetCoreUrl || !mustEnterUrl) {
+  } else {
     return <ChooseDevice />
-  } else  {
-    return <ChooseCoreModUrl setSpecifiedCoreMods={() => setSetCoreUrl(true)}/>
   }
 }
 
@@ -369,7 +314,7 @@ function NoCompatibleDevices() {
     <h3>No compatible devices?</h3>
 
     <p>
-      To use MBF, you must enable developer mode so that your Quest is accessible via USB.
+      To use the Lemonifier, you must enable developer mode so that your Quest is accessible via USB.
       <br />Follow the <a href="https://developer.oculus.com/documentation/native/android/mobile-device-setup/?locale=en_GB" target="_blank" rel="noopener noreferrer">official guide</a> -
       you'll need to create a new organisation and enable USB debugging.
     </p>

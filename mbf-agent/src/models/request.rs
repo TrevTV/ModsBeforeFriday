@@ -1,11 +1,10 @@
 //! Models used for communication *from the frontend to the backend*.
 
-use std::collections::HashMap;
 use serde::Deserialize;
 
 /// The default value for the game_id parameter.
 fn default_game_id() -> String {
-    "com.beatgames.beatsaber".to_string()
+    "com.StressLevelZero.BONELAB".to_string()
 }
 
 /// The default value for the ignore_package_id parameter.
@@ -24,11 +23,11 @@ fn default_agent_parameters() -> AgentRequestParameters {
 /// A struct that contains the game ID to be used for the agent and a flag indicating whether to skip the game ID check.
 #[derive(Deserialize)]
 pub struct AgentRequestParameters {
-    /// The ID of the Beat Saber APK on the device.
+    /// The ID of the game APK on the device.
     #[serde(default = "default_game_id")]
     pub game_id: String,
 
-    /// If true, the game ID check is skipped during qmod install.
+    /// If true, the game ID check is skipped during mod import.
     #[serde(default = "default_ignore_package_id")]
     pub ignore_package_id: bool,
 }
@@ -49,92 +48,52 @@ pub struct Request {
 #[serde(tag = "type")]
 pub enum RequestEnum {
     /// Gathers several pieces of data to check that the installation is modded appropriately, including:
-    /// - Whether the APK is patched
-    /// - The APK version
-    /// - The known installed mods and whether all their necessary files exist.
-    /// - The core mods that need to be installed.
-    /// - Whether the modloader is in the correct place
-    GetModStatus {
-        // If not null, this specifies a core mod JSON to use instead of the default core mods source.
-        // This is useful for developers testing a core mod update.
-        override_core_mod_url: Option<String>,
+    /// - Whether the APK is patched with MelonLoader (LemonLoader)
+    /// - The APK version and Unity version
+    /// - The modloader installation status
+    /// - The mods that are currently installed
+    GetModStatus,
+    /// Patches BONELAB to add MelonLoader to the APK, then reinstalls it.
+    ///
+    /// This includes downloading the latest MelonLoader data, an unstripped libunity.so for the
+    /// game's Unity version, patching the manifest, signing and reinstalling the game.
+    ///
+    /// If `repatch` is true, this is an update to an existing patched install;
+    /// otherwise this is a first-time patch. (The operation is the same either way.)
+    ///
+    /// Returns a `ModStatus` response reflecting the state of the installation after patching.
+    Patch {
+        repatch: bool,
     },
-    /// Installs or uninstalls any number of mods.
-    /// This will also attempt to download and install dependencies, upgrade dependencies and will uninstall any
-    /// depending mods of mods that have been disabled.
+    /// Installs or uninstalls any number of mods, by moving their DLL files between the
+    /// mods folder and the disabled subfolder.
     ///
     /// Returns a `ModSyncResult` response.
     SetModsEnabled {
-        statuses: HashMap<String, bool>,
+        statuses: std::collections::HashMap<String, bool>,
     },
-
-    // TODO: Make these lists to allow importing multiple mods at once?
-    /// Removes the mod with the given ID, which will uninstall dependant mods.
-    /// Returns a Mods message containing the mods now installed.
+    /// Deletes the mod with the given file name.
+    /// Returns a `Mods` message containing the mods now installed.
     RemoveMod {
         id: String,
     },
-    /// Imports a mod or file copy from the given path on the quest.
-    /// Returns an ImportedMod message containing the mods now installed, and the ID of the one that was imported, if importing a mod.
-    /// Returns an ImportedFileCopy message if the file type was copied by a mod copy extension.
-    /// Returns an ImportedSong message if the file type was copied to the songs folder.
+    /// Imports a mod from the given path on the quest.
+    /// The file may either be a mod DLL, or a ZIP archive containing one or more mod DLLs.
+    ///
+    /// Returns an `ImportResult` message containing the mods now installed, and the file name of the one that was imported.
     Import {
         from_path: String,
     },
     /// Downloads the file from the given URL and then attempts to import it.
-    /// Returns an ImportResult message.
+    ///
+    /// If this is a mod from a repository (e.g. Thunderstore), the details of the package should
+    /// be given, so that update checks can be performed later.
+    ///
+    /// Returns an `ImportResult` message.
     ImportUrl {
         from_url: String,
-    },
-
-    /// - Patches Beat Saber to add support for modloaders.
-    /// - Optionally, downgrades the game to the given version if downgrade_to is Some
-    /// - Saves the modloader to the appropriate locatioon on the Quest.
-    /// - Wipes any existing mods.
-    /// - Installs the core mods for the current version.
-    /// Returns a `Mods` response to update the frontend with the newly installed core mods.
-    Patch {
-        downgrade_to: Option<String>,
-        // The contents of the manifest of the patched app, as XML
-        // The frontend is reponsible for adding the necessary permissions and features here.
-        manifest_mod: String,
-        // The complete path to a PNG file to be used as the vr_splash.png file within the APK
-        // This is the splash screen that appears when starting the game in headset.
-        // This file will always be automatically deleted after patching, whether it succeeded or failed.
-        vr_splash_path: Option<String>,
-        // If this is true, patching will skip adding the modloader and libunity.so and will ONLY change permissions.
-        // Patching will also not attempt to reinstall core mods.
-        //
-        // TODO: in the future, it might make sense for remodding to detect a change in the libunity.so (harder)
-        // or libmainloader (easier) so that these can be easily updated.
-        remodding: bool,
-        // If this is true, patching will not be failed if core mods cannot be found for the version.
-        allow_no_core_mods: bool,
-        // If this is true, libovrplatformloader.so will be replaced with the old version to make the game work on quest 1
-        device_pre_v51: bool,
-        // If not null, this specifies a core mod JSON to use instead of the default core mods source.
-        // This is useful for developers testing a core mod update.
-        override_core_mod_url: Option<String>,
-    },
-
-    // Attempts to fix a blackscreen issue by removing PlayerData.dat from `/sdcard/...../files/`.
-    // (and copying it to /sdcard/ModsBeforeFriday so it isn't lost. It will also be copied to the datakeeper directory iff there isn't already one there)
-    // (This occurs when the permissions set by MBF copying the file lead to the game not being able to open it, typically on Quest 3,
-    // unfortunately chmod 777 doesn't seem to fix the issue.)
-    // Gives a `FixedPlayerData` response.
-    FixPlayerData,
-    /// Gets a copy of the AndroidManifest.xml for the given Beat Saber version, converted from AXML into an XML string.
-    GetDowngradedManifest {
-        version: String,
-    },
-    /// Reinstalls any core mods that are misssing/out of date and overwrites the modloader in case it is corrupt.
-    /// Should fix most issues with any installation.
-    /// Returns a `Mods` response containing the newly installed mods.
-    QuickFix {
-        // If not null, this specifies a core mod JSON to use instead of the default core mods source.
-        // This is useful for developers testing a core mod update.
-        override_core_mod_url: Option<String>,
-        // If true, this request will delete ALL mods before reinstalling only the core mods.
-        wipe_existing_mods: bool,
+        id: Option<String>,
+        name: Option<String>,
+        version: Option<String>,
     },
 }

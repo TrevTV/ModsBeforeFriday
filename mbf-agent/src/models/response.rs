@@ -7,28 +7,30 @@ use crate::mod_man;
 #[derive(Serialize)]
 pub struct AppInfo {
     pub loader_installed: Option<ModLoader>,
+    /// The version of MelonLoader the game was patched with, if it was patched by this tool.
+    pub installed_loader_version: Option<String>,
     pub obb_present: bool,
     #[serde(skip_serializing)]
     pub path: String,
     pub version: String,
-    pub manifest_xml: String,
+    /// The Unity version the game was built with, if it could be detected.
+    pub unity_version: Option<String>,
+    /// True only if an unstripped libunity.so is known to be available for the detected
+    /// Unity version, which is required to patch the game.
+    pub unity_deps_available: bool,
 }
 
+/// Information about the MelonLoader installation and updates.
+/// None if the latest release info could not be fetched (e.g. no internet connection).
 #[derive(Serialize)]
-pub struct CoreModsInfo {
-    /// All of the Beat Saber versions with core mods using Scotland2 are keys in this HashMap
-    pub supported_versions: Vec<String>,
-    /// The versions of Beat Saber that can be reached by downgrading the game.
-    pub downgrade_versions: Vec<String>,
-    /// True only if the Beat Saber version does not support mods, and the latest diff available in the diff index
-    /// is intended to start with a Beat Saber version older than the current version.
-    /// In these circumstances, the user needs to wait for a diff to be generated.
-    pub is_awaiting_diff: bool,
-    pub core_mod_install_status: InstallStatus,
+pub struct LoaderInfo {
+    /// The latest available LemonLoader (MelonLoader) release version.
+    pub latest_version: String,
+    pub install_status: InstallStatus,
 }
 
-/// An enum that represents whether a particular piece of the modded game is:
-#[derive(Copy, Clone, Serialize)]
+/// An enum that represents whether a particular part of the modded game is:
+#[derive(Copy, Clone, Serialize, Debug, PartialEq, Eq)]
 pub enum InstallStatus {
     /// Installed and up to date
     Ready,
@@ -49,8 +51,7 @@ pub enum LogLevel {
 
 #[derive(Serialize)]
 pub enum ModLoader {
-    Scotland2,
-    QuestLoader,
+    MelonLoader,
     Unknown,
 }
 
@@ -62,40 +63,31 @@ pub enum ImportResultType {
         installed_mods: Vec<ModModel>,
         imported_id: String,
     },
-    ImportedFileCopy {
-        // The full path where the file was copied to.
-        copied_to: String,
-        // The mod ID that the file copy belonged to
-        mod_id: String,
-    },
-    ImportedSong,
-    // A non-quest mod was detected (i.e. `.DLL`) and so the import failed.
-    NonQuestModDetected,
+    /// The file was not a mod (i.e. not a DLL or ZIP archive), so the import failed.
+    NonModFile,
 }
 
-/// The trimmed version of the ModInfo type that is sent to the web client.
+/// The trimmed version of the Mod type that is sent to the web client.
 #[derive(Serialize, Deserialize)]
 pub struct ModModel {
+    /// The file name of the mod DLL, which is also the ID used to enable/disable/remove the mod.
     pub id: String,
     pub name: String,
-    pub version: semver::Version,
-    pub game_version: Option<String>,
-    pub description: Option<String>,
+    /// The version of the repository package the mod was installed from, if known.
+    pub version: Option<String>,
+    /// The ID of the repository package the mod was installed from, if known.
+    pub repo_id: Option<String>,
     pub is_enabled: bool,
-    // True if the mod is core or if it is a required dependency of another core mod (potentially indirectly.)
-    pub is_core: bool,
 }
 
 impl From<&mod_man::Mod> for ModModel {
     fn from(value: &mod_man::Mod) -> Self {
         Self {
-            id: value.manifest().id.clone(),
-            name: value.manifest().name.clone(),
-            version: value.manifest().version.clone(),
-            game_version: value.manifest().package_version.clone(),
-            description: value.manifest().description.clone(),
-            is_enabled: value.installed(),
-            is_core: value.is_core(),
+            id: value.id().to_owned(),
+            name: value.name(),
+            version: value.meta.as_ref().and_then(|meta| meta.version.clone()),
+            repo_id: value.meta.as_ref().map(|meta| meta.id.clone()),
+            is_enabled: value.is_enabled,
         }
     }
 }
@@ -104,17 +96,15 @@ impl From<&mod_man::Mod> for ModModel {
 #[serde(tag = "type")]
 pub enum Response {
     ModStatus {
-        // None if Beat Saber is not installed.
+        // None if the game is not installed.
         app_info: Option<AppInfo>,
 
         // All mods currently found in the mods folder
         installed_mods: Vec<ModModel>,
 
-        // Information about the status of core mods.
-        // None if an internet connection could not be established.
-        core_mods: Option<CoreModsInfo>,
-
-        modloader_install_status: InstallStatus,
+        // Information about the status of the MelonLoader installation.
+        // None if the latest release info could not be fetched (e.g. no internet connection).
+        loader_info: Option<LoaderInfo>,
     },
     Mods {
         installed_mods: Vec<ModModel>,
@@ -126,10 +116,6 @@ pub enum Response {
         // containing a list of the errors generated.
         failures: Option<String>,
     },
-    Patched {
-        installed_mods: Vec<ModModel>,
-        did_remove_dlc: bool,
-    },
     ImportResult {
         result: ImportResultType, // The result of importing the file.
         used_filename: String, // The filename that was actually used to determine how to import the mod.
@@ -139,12 +125,5 @@ pub enum Response {
     LogMsg {
         message: String,
         level: LogLevel,
-    },
-    FixedPlayerData {
-        // True if a PlayerData.dat existed to fix, false if the request did nothing.
-        existed: bool,
-    },
-    DowngradedManifest {
-        manifest_xml: String,
     },
 }

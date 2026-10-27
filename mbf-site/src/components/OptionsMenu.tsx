@@ -1,17 +1,14 @@
 import { Adb, decodeUtf8 } from '@yume-chan/adb';
-import { uninstallBeatSaber } from '../DeviceModder';
-import { Children, ReactNode, useEffect, useRef, useState } from 'react';
-import { fixPlayerData, patchApp, quickFix } from '../Agent';
+import { uninstallGame } from '../DeviceModder';
+import { useEffect, useState } from 'react';
+import { patchApp } from '../Agent';
 import { toast } from 'react-toastify';
-import { PermissionsMenu } from './PermissionsMenu';
 import '../css/OptionsMenu.css'
 import { Collapsible } from './Collapsible';
 import { ModStatus } from '../Messages';
-import { AndroidManifest } from '../AndroidManifest';
 import { useSetError, wrapOperation } from '../SyncStore';
 import { Log } from '../Logging';
 import { confirm } from './Modal';
-import { SplashScreenSelector } from './SplashScreenSelector';
 import { useDeviceStore } from '../DeviceStore';
 import { gameId } from '../game_info';
 
@@ -21,7 +18,7 @@ interface OptionsMenuProps {
     modStatus: ModStatus
     visible?: boolean
 }
-    
+
 export function OptionsMenu({ quit, modStatus, setModStatus, visible }: OptionsMenuProps) {
     return <div className={`container mainContainer ${visible ? '' : 'hidden'}`} id="toolsContainer">
         <Collapsible title="Mod tools" defaultOpen>
@@ -30,8 +27,8 @@ export function OptionsMenu({ quit, modStatus, setModStatus, visible }: OptionsM
         <Collapsible title="ADB log" defaultOpen>
             <AdbLogger />
         </Collapsible>
-        <Collapsible title="Change Permissions/Repatch">
-            <RepatchMenu quit={quit} modStatus={modStatus}/>
+        <Collapsible title="Update LemonLoader/Repatch">
+            <RepatchMenu modStatus={modStatus} setModStatus={setModStatus}/>
         </Collapsible>
     </div>
 }
@@ -45,7 +42,7 @@ function ModToolButton({ onClick, text, description }: { onClick: () => void, te
     </div>
 }
 
-// Basic tools to do with managing the install, including a fix for a previously introduced bug.
+// Basic tools to do with managing the install.
 function ModTools({ quit, modStatus, setModStatus }: {
     quit: () => void,
     modStatus: ModStatus,
@@ -55,45 +52,45 @@ function ModTools({ quit, modStatus, setModStatus }: {
     return (
       <div id="modTools">
         <ModToolButton
-          text="Kill Beat Saber"
+          text="Kill BONELAB"
           description="Immediately closes the game."
           onClick={async () => {
             if (!device) return;
 
-            const setError = useSetError("Failed to kill Beat Saber process");
+            const setError = useSetError("Failed to kill BONELAB process");
             try {
                 await device.subprocess.noneProtocol.spawnWait(`am force-stop ${gameId}`);
-                toast.success("Successfully killed Beat Saber");
+                toast.success("Successfully killed BONELAB");
             }   catch(e) {
                 setError(e);
             }
           }}
         />
         <ModToolButton
-          text="Restart Beat Saber"
+          text="Restart BONELAB"
           description="Immediately closes and restarts the game."
           onClick={async () => {
             if (!device) return;
 
-            const setError = useSetError("Failed to kill Beat Saber process");
+            const setError = useSetError("Failed to restart BONELAB");
             try {
-              await device.subprocess.noneProtocol.spawnWait(`sh -c 'am force-stop ${gameId}; monkey -p com.beatgames.beatsaber -c android.intent.category.LAUNCHER 1'`);
-              toast.success("Successfully restarted Beat Saber");
+              await device.subprocess.noneProtocol.spawnWait(`sh -c 'am force-stop ${gameId}; monkey -p ${gameId} -c android.intent.category.LAUNCHER 1'`);
+              toast.success("Successfully restarted BONELAB");
             } catch (e) {
               setError(e);
             }
           }}
         />
         <ModToolButton
-          text="Reinstall only core mods"
-          description="Deletes all installed mods, then installs only the core mods."
+          text="Update LemonLoader"
+          description="Re-patches the game with the latest version of LemonLoader. Your mods are kept."
           onClick={async () => {
             if (!device) return;
             if (
                 !(await confirm(
-                    "Reinstall only core mods?",
+                    "Update LemonLoader?",
                     <>
-                        <p>This will delete all installed mods, then install only the core mods. You will need to reinstall any non-core mods you want to use.</p>
+                        <p>This will re-patch your BONELAB app with the latest version of LemonLoader. The game will be reinstalled, and your mods will be kept.</p>
                         <p>Are you sure you want to continue?</p>
                     </>
                 ))
@@ -103,25 +100,26 @@ function ModTools({ quit, modStatus, setModStatus }: {
             if (useDeviceStore.getState().device !== device) return;
 
             await wrapOperation(
-              "Reinstalling only core mods",
-              "Failed to reinstall only core mods",
+              "Updating LemonLoader",
+              "Failed to update LemonLoader",
               async () => {
-                setModStatus(await quickFix(device, modStatus, true));
-                toast.success("All non-core mods removed!");
+                setModStatus(await patchApp(device, true));
+                toast.success("Successfully updated LemonLoader!");
               }
             );
           }}
         />
         <ModToolButton
-          text="Uninstall Beat Saber"
-          description="Uninstalls the game: this will remove all mods and quit MBF."
+          text="Uninstall BONELAB"
+          description="Uninstalls the game and quits this tool. Your mods are kept in /sdcard/MelonLoader."
           onClick={async () => {
             if (!device) return;
             if (
                 !(await confirm(
-                    "Uninstall Beat Saber?",
+                    "Uninstall BONELAB?",
                     <>
-                        <p>This will uninstall Beat Saber, remove all mods, and quit MBF. You will need to reinstall the game from the Meta store.</p>
+                        <p>This will uninstall BONELAB and quit this tool. You will need to reinstall the game from the Meta store.</p>
+                        <p>Your mods will not be deleted, as they are stored outside of the game.</p>
                         <p>Are you sure you want to continue?</p>
                     </>
                 ))
@@ -130,27 +128,10 @@ function ModTools({ quit, modStatus, setModStatus }: {
             }
             if (useDeviceStore.getState().device !== device) return;
 
-            const setError = useSetError("Failed to uninstall Beat Saber");
+            const setError = useSetError("Failed to uninstall BONELAB");
             try {
-              await uninstallBeatSaber(device);
+              await uninstallGame(device);
               quit();
-            } catch (e) {
-              setError(e);
-            }
-          }}
-        />
-        <ModToolButton
-          text="Fix Player Data"
-          description="Fixes an issue with player data permissions."
-          onClick={async () => {
-            if (!device) return;
-            const setError = useSetError("Failed to fix player data");
-            try {
-              if (await fixPlayerData(device)) {
-                toast.success("Successfully fixed player data issues");
-              } else {
-                toast.error("No player data file found to fix");
-              }
             } catch (e) {
               setError(e);
             }
@@ -160,41 +141,26 @@ function ModTools({ quit, modStatus, setModStatus }: {
     );
 }
 
-function RepatchMenu({ modStatus, quit }: {
+// Re-patches the game, which updates LemonLoader to the latest version.
+function RepatchMenu({ modStatus, setModStatus }: {
     modStatus: ModStatus,
-    quit: (err: unknown) => void
-}
-) {
-    const { device, devicePreV51 } = useDeviceStore((store) => ({ 
-        device: store.device,
-        devicePreV51: store.devicePreV51
-    }));
-
-    let manifest = useRef(new AndroidManifest(modStatus.app_info!.manifest_xml));
-    useEffect(() => {
-        manifest.current.applyPatchingManifestMod();
-    }, []);
-    const [splashScreen, setSplashScreen] = useState(null as File | null);
+    setModStatus: (status: ModStatus) => void
+}) {
+    const { device } = useDeviceStore((store) => ({ device: store.device }));
 
     return <>
-        <p>Certain mods require particular Android permissions to be enabled in order to work. 
-            To change the permisions, you will need to re-patch your game, which can be done automatically with the button below.</p>
-        <PermissionsMenu manifest={manifest.current} />
+        <p>If your installation has issues (for example the modloader has an update available, or the game was patched with
+            an outdated version of LemonLoader), you can re-patch the game with the latest version of LemonLoader.</p>
+        <p>Mods are stored outside of the game, so they will not be affected.</p>
         <br/>
         <button onClick={async () => {
             if (!device) return;
 
-            await wrapOperation("Repatching Beat Saber", "Failed to repatch", async () => {
-                // TODO: Right now we do not set the mod status back to the DeviceModder state for it.
-                // This is fine at the moment since repatching does not update this state in any important way,
-                // but would be a problem if repatching did update it!
-                await patchApp(device, modStatus, null, manifest.current.toString(), true, false, false, splashScreen);
+            await wrapOperation("Repatching BONELAB", "Failed to repatch", async () => {
+                setModStatus(await patchApp(device, true));
                 toast.success("Successfully repatched");
             })
         }}>Repatch game</button>
-
-        <SplashScreenSelector selected={splashScreen}
-            onSelected={nowSelected => setSplashScreen(nowSelected)} />
     </>
 }
 
@@ -205,7 +171,7 @@ async function logcatToBlob(device: Adb, getCancelled: () => boolean): Promise<B
 
     // First clear the logcat buffer - we only want logs from events happening after the "start logcat" button is pressed.
     await device.subprocess.noneProtocol.spawnWait("logcat -c");
-    
+
     const process = await device.subprocess.noneProtocol.spawn("logcat");
     let killed = false;
 
@@ -255,7 +221,7 @@ function AdbLogger() {
                 setWaitingForLog(false);
             })
             .catch(e => Log.error("Failed to get ADB log " + e));
-        
+
         // When the value of `logging` changes to false, use the cleanup function to tell the `log` function to stop getting logs as soon as it can.
         return () => {
             cancelled = true;
@@ -268,8 +234,8 @@ function AdbLogger() {
         <p>Click the button below, <span className="warning">and keep your headset plugged in.</span> Open the game and do whatever it is that was causing you issues, then click the button again.</p>
 
         <p className="warning"></p>
-        {!logging ? 
-            <button onClick={async () => setLogging(true)}>Start Logging</button> : 
+        {!logging ?
+            <button onClick={async () => setLogging(true)}>Start Logging</button> :
             <button onClick={() => setLogging(false)}>Stop Logging</button>}
             <br/>
 

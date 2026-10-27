@@ -1,8 +1,7 @@
 import { AdbSync, AdbSyncWriteOptions, Adb, encodeUtf8, AdbPacketData, AdbCommand, packetListeners } from "@yume-chan/adb";
 import { Consumable, TextDecoderStream, MaybeConsumable, ReadableStream } from "@yume-chan/stream-extra";
-import { Request, Response, LogMsg, ModStatus, Mods, FixedPlayerData, ImportResult, DowngradedManifest, Patched, ModSyncResult, AgentParameters } from "./Messages";
+import { Request, Response, LogMsg, ModStatus, Mods, ImportResult, ModSyncResult, AgentParameters } from "./Messages";
 import { AGENT_SHA1 } from './agent_manifest';
-import { toast } from 'react-toastify';
 import { Log } from './Logging';
 import { gameId, ignorePackageId } from './game_info';
 
@@ -107,7 +106,7 @@ async function saveAgent(sync: AdbSync) {
 
   await Promise.race([timeoutPromise, sync.write(options)])
 }
-  
+
 async function downloadAgent(): Promise<Uint8Array> {
   const MAX_ATTEMPTS: number = 3;
   const PROGRESS_UPDATE_INTERVAL = 1000; // Time between download progress updates, in milliseconds
@@ -197,7 +196,7 @@ async function sendRequest(adb: Adb, request: Request): Promise<Response> {
     // Doesn't seem to consider that a chunk might not be valid UTF-8 on its own
     .pipeThrough(new TextDecoderStream())
     .getReader();
-  
+
   console.group("Agent Request");
   let buffer = "";
   let response: Response | null = null;
@@ -257,18 +256,12 @@ async function sendRequest(adb: Adb, request: Request): Promise<Response> {
   }
 }
 
-let CORE_MOD_OVERRIDE_URL: string | null = null;
-export function setCoreModOverrideUrl(core_mod_override_url: string | null) {
-  CORE_MOD_OVERRIDE_URL = core_mod_override_url;
-}
-
 // Gets the status of mods from the quest, i.e. whether the app is patched, and what mods are currently installed.
 export async function loadModStatus(device: Adb): Promise<ModStatus> {
   await prepareAgent(device);
 
   return await sendRequest(device, {
-      type: 'GetModStatus',
-      override_core_mod_url: CORE_MOD_OVERRIDE_URL,
+      type: 'GetModStatus'
   }) as ModStatus;
 }
 
@@ -283,22 +276,12 @@ export async function setModStatuses(device: Adb,
   return response as ModSyncResult;
 }
 
-// Gets the AndroidManifest.xml file for the given Beat Saber APK version, converted from AXML to XML.
-export async function getDowngradedManifest(device: Adb, gameVersion: string): Promise<string> {
-  let response = await sendRequest(device, {
-    type: 'GetDowngradedManifest',
-    version: gameVersion
-  });
-
-  return (response as DowngradedManifest).manifest_xml;
-}
-
 export async function importFile(device: Adb,
     file: File): Promise<ImportResult> {
   const sync = await device.sync();
   const tempPath = UploadsPath + file.name;
   try {
-    
+
     Log.debug("Uploading to " + tempPath);
 
     await sync.write({
@@ -317,11 +300,18 @@ export async function importFile(device: Adb,
   }
 }
 
+// Downloads the file at the given URL on the quest, then attempts to import it as a mod.
+// If the mod comes from a repository (e.g. Thunderstore), the details of the package should be
+// given so that update checks can be performed later.
 export async function importUrl(device: Adb,
-url: string) {
+  url: string,
+  repoPackage?: { id: string, name: string, version: string }): Promise<ImportResult> {
   const response = await sendRequest(device, {
     type: 'ImportUrl',
-    from_url: url
+    from_url: url,
+    id: repoPackage?.id ?? null,
+    name: repoPackage?.name ?? null,
+    version: repoPackage?.version ?? null
   });
 
   return response as ImportResult;
@@ -337,100 +327,13 @@ export async function removeMod(device: Adb,
   return (response as Mods).installed_mods;
 }
 
-// Instructs the agent to patch the app, adding the modloader and installing the core mods.
-// Updates the ModStatus `beforePatch` to reflect the state of the installation after patching.
-// (will not patch if the APK is already modded - will just extract the modloader and install core mods.)
-export async function patchApp(device: Adb,
-  beforePatch: ModStatus,
-  downgradeToVersion: string | null,
-  manifestMod: string,
-  remodding: boolean,
-  allow_no_core_mods: boolean,
-  device_pre_v51: boolean,
-  splashScreen: File | null): Promise<ModStatus> {
-  Log.debug("Patching with manifest: " + manifestMod);
-
-  let splashPath: string | null = null;
-  if(splashScreen !== null) {
-    const sync = await device.sync();
-    splashPath = UploadsPath + splashScreen.name;
-    try {
-      Log.debug(`Pushing splash to ${splashPath}`)
-      await sync.write({
-        filename: splashPath,
-        file: readableStreamFromByteArray(new Uint8Array(await splashScreen.arrayBuffer()))
-      })
-    } finally {
-      await sync.dispose();
-    }
-  }
-
+// Instructs the agent to patch the app, adding MelonLoader (LemonLoader) to the APK.
+// Returns the mod status of the installation after patching.
+export async function patchApp(device: Adb, repatch: boolean): Promise<ModStatus> {
   let response = await sendRequest(device, {
       type: 'Patch',
-      downgrade_to: downgradeToVersion,
-      manifest_mod: manifestMod,
-      allow_no_core_mods: allow_no_core_mods,
-      override_core_mod_url: CORE_MOD_OVERRIDE_URL,
-      device_pre_v51: device_pre_v51,
-      remodding,
-      vr_splash_path: splashPath
-  }) as Patched;
+      repatch
+  }) as ModStatus;
 
-  if(response.did_remove_dlc) {
-    toast.warning("MBF (temporarily) deleted installed DLC while downgrading your game. To get them back, FIRST restart your headset THEN download the DLC in-game.",
-        { autoClose: false })
-  }
-
-  // Return the new mod status assumed after patching
-  // (patching should fail if any of this is not the case)
-  return {
-      'type': 'ModStatus',
-      app_info: {
-          loader_installed: 'Scotland2',
-          version: downgradeToVersion ?? beforePatch.app_info!.version,
-          manifest_xml: manifestMod,
-          obb_present: beforePatch.app_info!.obb_present
-      },
-      core_mods: {
-          core_mod_install_status: "Ready",
-          supported_versions: beforePatch.core_mods!.supported_versions,
-          downgrade_versions: [],
-          is_awaiting_diff: false
-      },
-      modloader_install_status: "Ready",
-      installed_mods: response.installed_mods
-  };
-}
-
-// Instructs the agent to download and install any missing/outdated core mods, as well as push the modloader to the required location.
-// Should fix many common issues with an install.
-export async function quickFix(device: Adb,
-  beforeFix: ModStatus,
-  wipe_existing_mods: boolean): Promise<ModStatus> {
-  let response = await sendRequest(device, {
-      type: 'QuickFix',
-      override_core_mod_url: CORE_MOD_OVERRIDE_URL,
-      wipe_existing_mods
-  });
-
-  // Update the mod status to reflect the fixed installation
-  return {
-      'type': 'ModStatus',
-      app_info: beforeFix.app_info,
-      core_mods: {
-          core_mod_install_status: "Ready",
-          supported_versions: beforeFix.core_mods!.supported_versions,
-          downgrade_versions: beforeFix.core_mods!.downgrade_versions,
-          is_awaiting_diff: beforeFix.core_mods!.is_awaiting_diff
-      },
-      installed_mods: (response as Mods).installed_mods,
-      modloader_install_status: "Ready"
-  }
-}
-
-// Attempts to fix the black screen issue on Quest 3.
-export async function fixPlayerData(device: Adb): Promise<boolean> {
-  let response = await sendRequest(device, { type: 'FixPlayerData' });
-
-  return (response as FixedPlayerData).existed
+  return response;
 }

@@ -1,4 +1,10 @@
 //! Module containing all of the fixed file paths used by MBF, for easy changing throughout the project.
+//!
+//! NB: Unlike the old (Beat Saber/QMOD based) layout, most of the mod data lives inside the APK itself
+//! when using MelonLoader (LemonLoader).
+//! The only mod data stored on external storage is within `/sdcard/MelonLoader/{apk_id}`,
+//! which is where LemonLoader itself loads mods and plugins from.
+//! See: https://github.com/LemonLoader/MelonLoader/wiki/Mod-Installation-and-Preferences
 
 use std::sync::{OnceLock, LazyLock};
 
@@ -21,7 +27,7 @@ pub fn init_parameters(game_id: &str, ignore_package_id: bool) -> bool {
 }
 
 /// A static reference to the parameters for the agent.
-pub static PARAMETERS: LazyLock<AgentParameters> = LazyLock::new(|| _PARAMETERS.get_or_init(|| AgentParameters::new("com.beatgames.beatsaber", false)).clone());
+pub static PARAMETERS: LazyLock<AgentParameters> = LazyLock::new(|| _PARAMETERS.get_or_init(|| AgentParameters::new("com.StressLevelZero.BONELAB", false)).clone());
 
 /// A struct that contains the parameters for the agent, including various file paths and settings.
 #[derive(Clone)]
@@ -29,51 +35,34 @@ pub struct AgentParameters {
     /// The APK ID of the app being modded.
     pub apk_id: String,
 
-    /// If true, the game ID check is skipped during qmod install.
+    /// If true, the game ID check is skipped during mod import.
     pub _ignore_package_id: bool,
 
-    /// Directory that QMOD files are stored in.
-    /// `$` is replaced with the game version
-    pub qmods: String,
+    /// The folder that MelonLoader loads mods from.
+    /// Mods that are not enabled are moved to the `disabled` subfolder within this directory.
+    pub mods: String,
 
-    /// The legacy directory used to contain QMOD files in older builds of MBF.
-    pub old_qmods: String,
+    /// The folder that disabled mod files are moved into.
+    pub disabled_mods: String,
 
-    /// The path of the `.nomedia` file added to ModData.
-    pub moddata_nomedia: String,
+    /// The folder that MelonLoader loads plugins from.
+    pub plugins: String,
 
-    /// Directory containing the modloader.
-    pub modloader_dir: String,
-
-    /// Directory containing installed late mod files.
-    pub late_mods: String,
-
-    /// Directory containing installed early mod files.
-    pub early_mods: String,
-
-    /// Directory containing installed library files.
-    pub libs: String,
-
-    /// The Android `files` directory for the app being modded.
-    pub _android_app_files: String,
-
-    /// Path of the `PlayerData.dat` in the vanilla game.
-    pub player_data: String,
-
-    /// Path of the backup `PlayerData.dat` in the vanilla game.
-    pub player_data_bak: String,
+    /// The folder that MelonLoader mods store their configuration files in.
+    pub user_data: String,
 
     /// Directory containing OBBs for the app.
     pub obb_dir: String,
 
-    /// Path to the `PlayerData.dat` of the `datakeeper` mod.
-    pub datakeeper_player_data: String,
+    /// The path that the OBB directory is moved to while the game is being patched,
+    /// so that it isn't deleted when the app is uninstalled.
+    pub obb_backup_dir: String,
 
-    /// An auxillary path that `PlayerData.dat` is copied to when modding in case it is corrupted/lost for any other reason.
-    pub aux_data_backup: String,
+    /// The app's external data directory, which is wiped when the app is uninstalled.
+    pub app_data_dir: String,
 
-    /// The folder that SongCore loads custom levels from.
-    pub custom_levels: String,
+    /// The path that the app's external data directory is moved to while patching.
+    pub app_data_backup_dir: String,
 
     /// A folder that MBF uses to download temporary files.
     pub mbf_downloads: String,
@@ -83,9 +72,6 @@ pub struct AgentParameters {
 
     /// Path to the MBF resource cache.
     pub res_cache: String,
-
-    /// Directories no longer used by MBF that should be deleted on startup if detected.
-    pub legacy_dirs:  [String; 4],
 }
 
 /// Implements the `AgentParameters` struct, which contains various paths and settings used by the agent.
@@ -105,57 +91,35 @@ impl AgentParameters {
     /// ```rust
     /// let apk_id = "com.example.app";
     /// let paths = AgentParameters::new(apk_id);
-    /// println!("{}", paths.qmods); // Outputs: /sdcard/ModData/com.example.app/Packages/$
+    /// println!("{}", paths.mods); // Outputs: /sdcard/MelonLoader/com.example.app/Mods
     /// ```
     pub fn new<'a>(apk_id: &str, ignore_package_id: bool) -> AgentParameters {
         let local_tmp = "/data/local/tmp";
 
-        let apk_id = format!("{apk_id}").to_string();
-        let qmods = format!("/sdcard/ModData/{apk_id}/Packages/$").to_string();
-        let old_qmods = "/sdcard/ModsBeforeFriday/Mods".to_string();
-        let moddata_nomedia = format!("/sdcard/ModData/{apk_id}/.nomedia").to_string();
-        let modloader_dir = format!("/sdcard/ModData/{apk_id}/Modloader").to_string();
-        let late_mods = format!("{modloader_dir}/mods").to_string();
-        let early_mods = format!("{modloader_dir}/early_mods").to_string();
-        let libs = format!("{modloader_dir}/libs").to_string();
-        let android_app_files = format!("/sdcard/Android/data/{apk_id}/files").to_string();
-        let player_data = format!("{android_app_files}/PlayerData.dat").to_string();
-        let player_data_bak = format!("{android_app_files}/PlayerData.dat.bak").to_string();
+        let melon_root = format!("/sdcard/MelonLoader/{apk_id}").to_string();
+        let mods = format!("{melon_root}/Mods").to_string();
+        let disabled_mods = format!("{mods}/disabled").to_string();
+        let plugins = format!("{melon_root}/Plugins").to_string();
+        let user_data = format!("{melon_root}/UserData").to_string();
         let obb_dir = format!("/sdcard/Android/obb/{apk_id}/").to_string();
-        let datakeeper_player_data = format!("/sdcard/ModData/{apk_id}/Mods/datakeeper/PlayerData.dat").to_string();
-        let aux_data_backup = "/sdcard/ModsBeforeFriday/PlayerData.backup.dat".to_string();
-        let custom_levels = format!("/sdcard/ModData/{apk_id}/Mods/SongCore/CustomLevels").to_string();
-        let mbf_downloads = format!("{local_tmp}/mbf/downloads").to_string();
-        let temp = format!("{local_tmp}/mbf/tmp").to_string();
-        let res_cache = format!("{local_tmp}/mbf/res-cache").to_string();
-        let legacy_dirs = [
-            format!("{local_tmp}/mbf-downloads").to_string(),
-            format!("{local_tmp}/mbf-res-cache").to_string(),
-            format!("{local_tmp}/mbf-tmp").to_string(),
-            format!("{local_tmp}/mbf-uploads").to_string(),
-        ];
+        let obb_backup_dir = format!("/sdcard/Android/{apk_id}.obb.lemonify").to_string();
+        let app_data_dir = format!("/sdcard/Android/data/{apk_id}").to_string();
+        let app_data_backup_dir = format!("/sdcard/Android/data/{apk_id}.lemonify_backup").to_string();
 
         Self {
-            apk_id,
+            apk_id: apk_id.to_string(),
             _ignore_package_id: ignore_package_id,
-            qmods,
-            old_qmods,
-            moddata_nomedia,
-            modloader_dir,
-            late_mods,
-            early_mods,
-            libs,
-            _android_app_files: android_app_files,
-            player_data,
-            player_data_bak,
+            mods,
+            disabled_mods,
+            plugins,
+            user_data,
             obb_dir,
-            datakeeper_player_data,
-            aux_data_backup,
-            custom_levels,
-            mbf_downloads,
-            temp,
-            res_cache,
-            legacy_dirs
+            obb_backup_dir,
+            app_data_dir,
+            app_data_backup_dir,
+            mbf_downloads: format!("{local_tmp}/mbf/downloads"),
+            temp: format!("{local_tmp}/mbf/tmp"),
+            res_cache: format!("{local_tmp}/mbf/res-cache"),
         }
     }
 }

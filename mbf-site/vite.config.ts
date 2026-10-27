@@ -8,6 +8,9 @@ export default defineConfig({
     plugins: [react(), viteTsconfigPaths(), mkcert()],
     server: {
         open: process.env.BROWSER='chrome',
+        // Bind all interfaces so both 127.0.0.1 (IPv4) and ::1 (IPv6) work;
+        // some browsers resolve `localhost` to IPv4 only.
+        host: true,
         port: 3000,
         https: true,
     },

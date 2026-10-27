@@ -1,5 +1,8 @@
 #!/bin/python3
 
+# CLI wrapper around the MBF agent, handy for developers or Chromium-haters.
+# Requires the `adb` CLI to be on the PATH, with your headset connected.
+
 import argparse
 import hashlib
 import json
@@ -9,8 +12,6 @@ import subprocess
 import sys
 from threading import Thread
 from queue import Queue
-import requests
-import xml.etree.ElementTree as ET
 
 TRACE=4
 DEBUG=3
@@ -57,7 +58,7 @@ class Wrapper():
         except FileNotFoundError:
             self.log("MBF agent not found at correct path relative to wrapper. Assuming agent already pushed by website.", level=WARN)
             return
-        
+
         local_hash = local_hasher.hexdigest()
         remote_hash = subprocess.run(['adb', 'shell', 'sha1sum', '/data/local/tmp/mbf-agent', '|', 'cut', '-f', '1', '-d', '" "'], universal_newlines=True, stdout=subprocess.PIPE).stdout[:-1];
 
@@ -86,8 +87,8 @@ class Wrapper():
                 self.log('Invalid Arguments', level=ERROR)
 
     def get_mod_status(self, args):
-        self.send_payload('GetModStatus', override_core_mod_url = args.override_core_mod_url)
-    
+        self.send_payload('GetModStatus')
+
     def set_mod_statuses(self, args):
         statuses = dict()
 
@@ -107,8 +108,9 @@ class Wrapper():
         args.disable = None
 
         for file in args.files:
-            subprocess.run(['adb', 'push', file, f'/data/local/tmp/mbf/uploads/{os.path.basename(args["file"])}'])
-            self.send_payload('Import', from_path=f'/data/local/tmp/mbf/uploads/{os.path.basename(self.file)}')
+            filename = os.path.basename(file)
+            subprocess.run(['adb', 'push', file, f'/data/local/tmp/mbf/uploads/{filename}'])
+            self.send_payload('Import', from_path=f'/data/local/tmp/mbf/uploads/{filename}')
 
             if 'imported_id' in self.import_result['result']:
                 args.enable += [self.import_result['result']['imported_id']]
@@ -119,119 +121,33 @@ class Wrapper():
         args.disable = None
 
         for url in args.urls:
-            self.send_payload('ImportUrl', from_url=url)
+            payload = {'from_url': url}
+
+            if args.thunderstore:
+                # Treat the URL as a Thunderstore package download, so that the mod can be
+                # associated with its package for update checks.
+                # URLs look like: https://thunderstore.io/package/download/{author}/{name}/{version}/
+                parts = url.rstrip('/').split('/')
+                if len(parts) >= 4 and parts[-4] == 'download':
+                    author, name, version = parts[-3], parts[-2], parts[-1]
+                    payload |= {
+                        'id': f'{author}-{name}',
+                        'name': name,
+                        'version': version,
+                    }
+                else:
+                    self.log(f'"{url}" does not look like a Thunderstore package download URL, importing without package metadata', level=WARN)
+
+            self.send_payload('ImportUrl', **payload)
 
             if 'imported_id' in self.import_result['result']:
                 args.enable += [self.import_result['result']['imported_id']]
 
         self.set_mod_statuses(args)
-
-    def get_global_mods(self, args):
-        if not hasattr(args, 'override_core_mod_url'):
-            args.override_core_mod_url = None
-
-        if not hasattr(args, 'game_version'):
-            args.game_version = 'auto'
-            self.auto_game_version(args)
-
-        url = f'https://mods.bsquest.xyz/{args.game_version}.json'
-        self.global_mods = json.loads(requests.get(url).text)
-
-    def show_global_mods(self, args):
-        if not hasattr(self, 'global_mods'):
-            self.get_global_mods(args)
-
-        self.log('\033[1mAvailable Mods\033[0m')
-        for id in self.global_mods:
-            latest_version = list(self.global_mods[id].keys())[-1]
-            mod = self.global_mods[id][latest_version]
-            self.log(f'  \033[1m{mod["name"]}\033[0m')
-            self.log(f'    ID: \033[1m{id}\033[0m')
-            self.log(f'    Author: \033[1m{mod["author"]}\033[0m')
-            self.log(f'    Version: \033[1mv{mod["version"]}\033[0m\n')
-
-    def import_id(self, args):
-        if not hasattr(self, 'global_mods'):
-            self.get_global_mods(args)
-
-        args.enable = []
-        args.disable = None
-
-        for id in args.ids:
-            if id not in self.global_mods:
-                self.log(f'The mod \'{id}\' was not found in the global API! It will not be installed', level=ERROR)
-                continue
-
-            latest_version = list(self.global_mods[id].keys())[-1]
-            url = self.global_mods[id][latest_version]['download']
-            self.send_payload('ImportUrl', from_url=url)
-
-            if 'imported_id' in self.import_result['result']:
-                args.enable += [self.import_result['result']['imported_id']]
-
-        self.set_mod_statuses(args)
-
-    def auto_game_version(self, args):
-        if not hasattr(self, 'mod_status'):
-            self.get_mod_status(args)
-
-        if not self.mod_status['core_mods']:
-            self.log('    \033[33m Core Mod data not found! Is your headset connected to the internet?', level=WARN)
-            return
-
-        if args.game_version == 'auto':
-            supported_versions = self.mod_status['core_mods']['supported_versions']
-
-            supported_versions.sort(key = lambda version: version.replace('_', '.').split('.'))
-
-            args.game_version = supported_versions[-1]
 
     def patch(self, args):
-        if not self.mod_status['core_mods']:
-            self.log('    \033[33m Core Mod data not found! Is your headset connected to the internet?', level=WARN)
-            return
-            
-        self.auto_game_version(args)
-
-        args.manifest_mod = None
-        args.override_core_mod_url = None
-
-        self.get_downgraded_manifest(args)
-
-        manifest_xml = ET.fromstring(self.manifest_mod)
-        external_storage_permissions = ET.Element('uses-permission', **{'ns0:name':'android.permission.MANAGE_EXTERNAL_STORAGE'})
-        manifest_xml.insert(7,external_storage_permissions)
-
-        self.parsed_manifest = ET.tostring(manifest_xml).decode('utf8')
-
-        payload_args = {
-                'downgrade_to': args.game_version,
-                'manifest_mod': self.parsed_manifest,
-                'remodding': args.remodding,
-                'allow_no_core_mods': args.allow_no_core_mods}
-
-        if args.no_downgrade or args.game_version == self.mod_status['app_info']['version']:
-            del payload_args['downgrade_to']
-
-        if args.override_core_mod_url:
-            payload_args['override_core_mod_url'] = args.override_core_mod_url
-        
+        payload_args = {'repatch': args.repatch}
         self.send_payload('Patch', **payload_args)
-
-    def fix_player_data(self, args):
-        self.send_payload('FixPlayerData')
-
-    def get_downgraded_manifest(self, args):
-        self.auto_game_version(args)
-
-        self.send_payload('GetDowngradedManifest', version = args.game_version)
-
-        self.manifest_mod = self.downgraded_manifest
-
-    def quick_fix(self, args):
-        self.send_payload('QuickFix',
-                          override_core_mod_url=args.override_core_mod_url,
-                          wipe_existing_mods=args.wipe_existing_mods)
 
     def read_pipe(self, pipe, queue):
         try:
@@ -282,45 +198,42 @@ class Wrapper():
 
         if response_type == 'ModStatus':
             self.mod_status = response
-            
+
             self.log('\033[1mMod Status\033[0m')
 
             # App Info
-            if 'app_info' in response:
+            if 'app_info' in response and response['app_info'] is not None:
+                app_info = response['app_info']
                 self.log('  \033[1;90mApp Info\033[0m')
-                self.log(f'    Loader Installed: {response["app_info"]["loader_installed"]}')
-                self.log(f'    OBB Present: {self.color_bool(response["app_info"]["obb_present"])}')
-                self.log(f'    Version: {response["app_info"]["version"]}\n')
-                self.log(f'    Manifest XML: {response["app_info"]["manifest_xml"]}\n', level=TRACE)
+                self.log(f'    Loader Installed: {app_info["loader_installed"]}')
+                self.log(f'    Installed Loader Version: {app_info["installed_loader_version"]}')
+                self.log(f'    OBB Present: {self.color_bool(app_info["obb_present"])}')
+                self.log(f'    Version: {app_info["version"]}')
+                self.log(f'    Unity Version: {app_info["unity_version"]}')
+                self.log(f'    Unity Deps Available: {self.color_bool(app_info["unity_deps_available"])}\n')
+
+                if not app_info['obb_present']:
+                    self.log('    OBB file not detected! The game may not start!', level=WARN)
+            else:
+                self.log('  The game is not installed!', level=WARN)
+
+            # Loader info
+            if 'loader_info' in response and response['loader_info'] is not None:
+                loader_info = response['loader_info']
+                status = loader_info['install_status']
+                status_code = '\033[32m' if status == 'Ready' \
+                        else '\033[33m' if status == 'NeedUpdate' \
+                        else '\033[31m'
+                self.log('  \033[1;92mLemonLoader\033[0m', level=DEBUG)
+                self.log(f'    Latest Version: {loader_info["latest_version"]}', level=DEBUG)
+                self.log(f'    Install Status: {status_code}{status}\033[0m', level=DEBUG)
+            else:
+                self.log('  \033[33m LemonLoader release info not found! Is your headset connected to the internet?', level=WARN)
 
             # Installed Mods
             self.log('  \033[1;32mInstalled Mods\033[0m')
             for mod in response['installed_mods']:
                 self.log_mod(mod)
-
-            # Core Mods
-            if 'core_mods' in response and response['core_mods']:
-                self.log('  \033[1;92mCore Mods\033[0m', level=DEBUG)
-
-                core_status = response['core_mods']['core_mod_install_status']
-                core_status_code = '\033[32m' if core_status == 'Ready' \
-                        else '\033[33m' if core_status == 'NeedUpdate' \
-                        else '\033[31m'
-                self.log(f'    Core Mod Install Status: {core_status_code}{core_status}', level=DEBUG)
-                self.log('    Supported Versions', level=DEBUG)
-                for supported_version in response['core_mods']['supported_versions']:
-                    self.log(f'      {supported_version}', level=DEBUG)
-                self.log('    Downgrade Versions', level=DEBUG)
-                for downgrade_version in response['core_mods']['downgrade_versions']:
-                    self.log(f'      {downgrade_version}', level=DEBUG)
-
-                self.log(f'    Is Awaiting Diff? {self.color_bool(response["core_mods"]["is_awaiting_diff"], flipped=True)}', level=DEBUG)
-            else:
-                self.log('    \033[33m Core Mod data not found! Is your headset connected to the internet?', level=WARN)
-
-            # OBB File Warning
-            if not response['app_info']['obb_present']:
-                self.log(f'    OBB file not detected! BeatSaber may not start!', level=WARN)
 
         elif response_type == 'Mods':
             self.mods = response
@@ -348,19 +261,6 @@ class Wrapper():
             # Failures
             self.log(f'  \033[1;31mFailures\033[0m: {response["failures"]}', level=ERROR)
 
-        elif response_type == 'Patched':
-            self.patched = response
-
-            self.log('\033[1mPatched\033[0m')
-
-            # Installed Mods
-            self.log('  \033[1;32mInstalled Mods\033[0m')
-            for mod in response['installed_mods']:
-                self.log_mod(mod)
-
-            # DLC Removal Warning
-            if response['did_remove_dlc']:
-                self.log('  MBF (temporarily) deleted installed DLC while downgrading your game. To get them back, FIRST restart your headset, THEN download the DLC in-game', level=WARN)
         elif response_type == 'ImportResult':
             self.import_result = response
 
@@ -369,21 +269,14 @@ class Wrapper():
             import_type = response['result']['type']
 
             installed_mods = None
-            copied_to = None
             imported_id = None
 
             if import_type == 'ImportedMod':
                 import_type = '\033[36mMod'
                 installed_mods = response['result']['installed_mods']
                 imported_id = response['result']['imported_id']
-            elif import_type == 'ImportedFileCopy':
-                import_type = '\033[35mFile Copy'
-                copied_to = response['result']['copied_to']
-                imported_id = response['result']['mod_id']
-            elif import_type == 'ImportedSong':
-                import_type = '\033[93mSong'
-            elif import_type == 'NonQuestModDetected':
-                import_type = '\033[31mNON-QUEST MOD'
+            elif import_type == 'NonModFile':
+                import_type = '\033[31mNOT A MOD'
 
             self.log(f'  \033[1;96mType\033[0m: {import_type}\033[0m')
 
@@ -392,23 +285,11 @@ class Wrapper():
                 for mod in installed_mods:
                     self.log_mod(mod)
 
-            if copied_to:
-                self.log(f'  \033[90mCopied To\033[0m: {copied_to}', level=DEBUG)
-
             if imported_id:
                 self.log(f'  \033[1;34mID\033[0m: {imported_id}')
-
-        elif response_type == 'FixedPlayerData':
-            self.fixed_player_data = response
-
-            self.log('\033[1mFixed Player Data\033[0m')
-            self.log(f'  \033[1;95mExisted\033[0m: {self.color_bool(response["existed"])}')
-        elif response_type == 'DowngradedManifest':
-            self.log('\033[1mReceived Downgraded Manifest\033[0m')
-            self.downgraded_manifest = response['manifest_xml']
         else:
             self.log(f'Response type {response_type} has not been implemented!', level=ERROR)
-            self.log(f'Respone was {response}', level=DEBUG)
+            self.log(f'Response was {response}', level=DEBUG)
 
     def color_bool(self, boolean, flipped=False):
         code = '\033[32m' if (boolean ^ flipped) else '\033[31m'
@@ -423,11 +304,10 @@ class Wrapper():
         else:
             enabled = '\033[31mFalse\033[0m'
         self.log(f'{indent}  Enabled: {enabled}')
-        self.log(f'{indent}  Core Mod: {mod["is_core"]}', level=DEBUG)
         self.log(f'{indent}  Version: {mod["version"]}')
         self.log(f'{indent}  ID: {mod["id"]}')
-        self.log(f'{indent}  Game Version: {mod["game_version"]}', level=DEBUG)
-        self.log(f'{indent}  Description: {mod["description"]}\n')
+        self.log(f'{indent}  Repo ID: {mod["repo_id"]}', level=DEBUG)
+        self.log('')
 
     def log(self, text, level=INFO):
         if type(level) == str:
@@ -466,11 +346,7 @@ class Wrapper():
         interactive_parser = subparser.add_parser('Interactive', help='Run in interactive mode')
         interactive_parser.set_defaults(func=self.interactive)
 
-        get_global_mods_parser = subparser.add_parser('GetGlobalMods', help='Outputs a list of all available mods for your current version')
-        get_global_mods_parser.set_defaults(func=self.show_global_mods)
-
         get_status_parser = subparser.add_parser('GetModStatus', help='Get the current status of mods on the headset')
-        get_status_parser.add_argument('-o', '--override_core_mod_url', help='Use a custom URL for core mods')
         get_status_parser.set_defaults(func=self.get_mod_status)
 
         set_status_parser = subparser.add_parser('SetModStatuses', help='Mass enable/disable mods')
@@ -478,11 +354,6 @@ class Wrapper():
         set_status_parser.add_argument('-e', '--enable', nargs='+', help='A list of mod IDs to enable')
         set_status_parser.add_argument('-d', '--disable', nargs='+', help='A list of mod IDs to disable')
         set_status_parser.set_defaults(func=self.set_mod_statuses)
-
-        get_manifest_parser = subparser.add_parser('GetDowngradeManifest', help='Get the manifest for Beat Saber')
-        self.get_manifest_parser = get_manifest_parser
-        get_manifest_parser.add_argument('-g', '--game_version', default='auto', help='Which version of Beat Saber to get the manifest for')
-        get_manifest_parser.set_defaults(func=self.get_downgraded_manifest)
 
         import_parser = subparser.add_parser('Import', help='Import a mod')
         self.import_parser = import_parser
@@ -496,36 +367,18 @@ class Wrapper():
         import_url_parser = import_subparser.add_parser('URL', help='Import a mod from a URL')
         self.import_url_parser = import_url_parser
         import_url_parser.add_argument('urls', nargs='+', help='The URL(s) to import')
+        import_url_parser.add_argument('-t', '--thunderstore', action='store_true', help='Treat the URL(s) as Thunderstore package downloads, storing package metadata alongside the mod')
         import_url_parser.set_defaults(func=self.import_url)
-
-        import_id_parser = import_subparser.add_parser('ID', help='Import a mod by ID')
-        self.import_id_parser = import_id_parser
-        import_id_parser.add_argument('ids', nargs='+', help='The ID(s) to import')
-        import_id_parser.set_defaults(func=self.import_id)
 
         remove_parser = subparser.add_parser('RemoveMod', help='Remove/Uninstall a mod')
         self.remove_parser = remove_parser
         remove_parser.add_argument('mod_id', help='The mod ID to remove')
         remove_parser.set_defaults(func=self.remove_mod)
 
-        patch_parser = subparser.add_parser('Patch', help='Patch the game with a mod loader')
+        patch_parser = subparser.add_parser('Patch', help='Patch the game with LemonLoader')
         self.patch_parser = patch_parser
-        patch_parser.add_argument('-g', '--game_version', default='auto', help='Which version of the game to downgrade to')
-        patch_parser.add_argument('-a', '--allow_no_core_mods', action='store_true', help='Allows installing versions that do not have core mods')
-        patch_parser.add_argument('-o', '--override_core_mod_url', help='Use a custom URL for core mods')
-        patch_parser.add_argument('-n', '--no_downgrade', action='store_true', help='Use the existing beatsaber version. Do not downgrade')
-        patch_parser.add_argument('-r', '--remodding', action='store_true', help='Informs the agent that it should be remodding the game')
-        patch_parser.add_argument('-m', '--manifest', help='Specifies a custom .xml file to use as the app manifest')
+        patch_parser.add_argument('-r', '--repatch', action='store_true', help='Informs the agent that it is re-patching an already modded install')
         patch_parser.set_defaults(func=self.patch)
-
-        self.fix_player_data_parser = subparser.add_parser('FixPlayerData', help='Fixes permissions issues which can cause a black screen in some cases')
-        self.fix_player_data_parser.set_defaults(func=self.fix_player_data)
-
-        quick_fix_parser = subparser.add_parser('QuickFix', help='Installs any missing/outdated core mods, and pushes the modloader to the required location')
-        self.quick_fix_parser = quick_fix_parser
-        quick_fix_parser.add_argument('-o', '--override_core_mod_url', help='Use a custom URL for core mods')
-        quick_fix_parser.add_argument('-w', '--wipe_existing_mods', action='store_true', help='Wipes all existing mods')
-        quick_fix_parser.set_defaults(func=self.quick_fix)
 
 # To ignore errors in interactive mode
 class ArgumentParser(argparse.ArgumentParser):
